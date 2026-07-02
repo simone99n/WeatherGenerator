@@ -11,11 +11,11 @@ case "$1" in
       # Creates a virtual environment without checking the integrity of the cache.
       # If we are running on a mac, use the cpu extra
       if [[ "$(uname)" == "Darwin" ]]; then
-        uv sync --all-packages --extra cpu --native-tls
+        uv sync --all-packages --extra cpu
         exit 0
       fi
       # Otherwise, use the gpu extra
-      uv sync --all-packages --extra gpu --native-tls
+      uv sync --all-packages --extra gpu
     )
     ;;
   sync-safe)
