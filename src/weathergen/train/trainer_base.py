@@ -27,7 +27,7 @@ class TrainerBase:
         self.cf: Config | None = None
 
     @staticmethod
-    def init_torch(use_cuda=True, num_accs_per_task=1, multiprocessing_method="fork"):
+    def init_torch(use_cuda=True, num_accs_per_task=1, multiprocessing_method="spawn"):
         """
         Initialize torch, set device and multiprocessing method.
 
@@ -50,7 +50,10 @@ class TrainerBase:
             return torch.device("cpu")
 
         # if local_id_node == "-1":
-        local_id_node = dist.get_node_local_rank(fallback_rank=-1)
+        # local rank inside the node, -1 if not using torchrun or scheduling system
+        # local_id_node = dist.get_node_local_rank(fallback_rank=-1) # TODO provare int(os.environ.get("LOCAL_RANK", -1)) oppure
+        local_id_node = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "-1")))
+        print("local_id_node:", local_id_node, "num_accs_per_task:", num_accs_per_task)
         if local_id_node == -1:
             devices = ["cuda"]
         else:
@@ -58,6 +61,7 @@ class TrainerBase:
             devices = [
                 f"cuda:{local_id_node * num_accs_per_task + i}" for i in range(num_accs_per_task)
             ]
+        print("device:", devices)
         torch.cuda.set_device(local_id_node * num_accs_per_task)
 
         return devices
@@ -87,10 +91,11 @@ class TrainerBase:
                 local_rank = int(os.environ.get("SLURM_LOCALID"))
             rank = int(os.environ.get("RANK", "-1"))
             if rank == -1:
-                ranks_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", "1")[0])
+                ranks_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", "1")[0]) # TODO rimuovere [0]
                 rank = int(os.environ.get("SLURM_NODEID")) * ranks_per_node + local_rank
             master_addr = os.environ.get("MASTER_ADDR", "localhost")
             master_port = os.environ.get("MASTER_PORT", f"{PORT}")  # Default port
+            print(f"DDP master_addr: {master_addr}, master_port: {master_port}, rank: {rank}, local_rank: {local_rank}, world_size: {world_size}")
 
             if torch.accelerator.is_available():
                 device_type = torch.accelerator.current_accelerator()
@@ -102,10 +107,11 @@ class TrainerBase:
                 print(f"Running on device {device}")
 
             backend = torch.distributed.get_default_backend_for_device(device)
+            print(f"DDP initialization: backend={backend}, device={device}, rank={rank}, world_size={world_size}, init_method=tcp://{master_addr}:{master_port}")
             torch.distributed.init_process_group(
                 backend=backend,
                 world_size=world_size,
-                device_id=device,
+                # device_id=device, # TODO provare a commentare device_id=device, per vedere se funziona anche senza
                 rank=rank,
                 init_method=f"tcp://{master_addr}:{master_port}",
             )

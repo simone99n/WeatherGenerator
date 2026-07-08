@@ -130,14 +130,14 @@ train_logging:
 # parameters for data loading
 data_loading :
 
-  num_workers: 12
+  num_workers: 1
   rng_seed: ???
   repeat_data_in_mini_epoch : False
 
   # pin GPU memory for faster transfer; it is possible that enabling memory_pinning with 
   # FSDP2 + DINOv2 can cause the job to hang and trigger a PyTorch timeout error.
   # If this happens, you can disable the flag, but performance will drop on GH200.
-  memory_pinning: True
+  memory_pinning: False
 
 
 # config for training
@@ -210,7 +210,7 @@ validation_config:
   
   # whether to track the exponential moving average of weights for validation
   validate_with_ema: 
-    enabled : True
+    enabled : False
     ema_ramp_up_ratio: 0.09
     ema_halflife_in_thousands: 1e-3
 
