@@ -13,7 +13,7 @@ import os
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing
+import torch.multiprocessingcat 
 
 from weathergen.common.config import Config
 from weathergen.train.utils import str_to_tensor, tensor_to_str
