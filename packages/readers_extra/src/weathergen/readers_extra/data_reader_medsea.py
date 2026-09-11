@@ -72,6 +72,16 @@ TIME_DIM = "time_counter"
 # Sea cells at the surface, out of the 380 * 1016 = 386080 cells of the box.
 N_SEA_POINTS = 144990
 
+# Every line below that changes the shape of an array says what the new shape
+# is, using these names:
+#
+#   rows, cols   the grid, NY by NX
+#   cells        the grid flattened, rows * cols, sea and land together
+#   levels       the 18 depths
+#   points       the sea cells only, which is all this reader returns
+#   days         the days of the time window being asked for
+#   channels     the channels being asked for
+
 # One channel per surface variable, plus one per level for the deep ones. The
 # name carries the depth in metres, rounded: votemper_1m ... votemper_971m.
 CHANNELS: list[str] = []
@@ -99,7 +109,7 @@ class DataReaderMedSea(DataReaderTimestep):
         # open_zarr reads the metadata only. No data is loaded here, and one
         # reader handles one year: the framework makes one per file in the list.
         self.ds = xr.open_zarr(filename, consolidated=True, chunks=None, zarr_format=2)
-        self.times = self.ds.coords[TIME_DIM].values
+        self.times = self.ds.coords[TIME_DIM].values  # (days in this store,)
 
         data_start_time = self.times[0]
         data_end_time = self.times[-1]
@@ -115,28 +125,28 @@ class DataReaderMedSea(DataReaderTimestep):
         super().__init__(tw_handler, stream_info, data_start_time, data_end_time, period)
         self.len = len(self.times)
 
-        lat = LAT0 + np.arange(NY, dtype=np.float32) * DXY
-        lon = LON0 + np.arange(NX, dtype=np.float32) * DXY
-        lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")
+        lat = LAT0 + np.arange(NY, dtype=np.float32) * DXY  # (rows,)
+        lon = LON0 + np.arange(NX, dtype=np.float32) * DXY  # (cols,)
+        lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")  # both (rows, cols)
 
         # The land-sea mask is nowhere in the file: it is only the pattern of
         # NaN in the data. It never changes with time, so we read it once, here,
         # instead of looking for NaN in every sample.
-        wet = np.isfinite(self.ds["votemper"].isel({TIME_DIM: 0}).values)
-        wet = wet.reshape(len(DEPTH_M), NY * NX)
+        wet = np.isfinite(self.ds["votemper"].isel({TIME_DIM: 0}).values)  # (levels, rows, cols)
+        wet = wet.reshape(len(DEPTH_M), NY * NX)  # (levels, cells)
 
         # We return one point per sea cell. Land is simply not in the list, so
         # the model never sees it: 386080 cells become 144990 points.
-        self.sea_points = np.flatnonzero(wet[0])
-        self.latitudes = lat_grid.reshape(-1)[self.sea_points]
-        self.longitudes = lon_grid.reshape(-1)[self.sea_points]
+        self.sea_points = np.flatnonzero(wet[0])  # (points,), an index into cells
+        self.latitudes = lat_grid.reshape(-1)[self.sea_points]  # (points,)
+        self.longitudes = lon_grid.reshape(-1)[self.sea_points]  # (points,)
         self.n_points = len(self.sea_points)
 
         # A cell that is sea at one level is sea at every level above it, so
         # counting the sea levels of a column gives the depth of its floor. This
         # is how the model is told where the deep channels have no data.
-        n_levels = wet.sum(axis=0)[self.sea_points]
-        self.floor_depth = np.array(DEPTH_M, dtype=np.float32)[n_levels - 1]
+        n_levels = wet.sum(axis=0)[self.sea_points]  # (points,)
+        self.floor_depth = np.array(DEPTH_M, dtype=np.float32)[n_levels - 1]  # (points,)
 
         self.source_channels = stream_info.get("source", CHANNELS)
         self.source_idx = [CHANNELS.index(c) for c in self.source_channels]
@@ -160,11 +170,13 @@ class DataReaderMedSea(DataReaderTimestep):
             f"Make them once with make_medsea_norm_stats.py."
         )
         stats = json.loads(stats_path.read_text())
+        # Both (all channels,): the framework indexes them with source_idx and
+        # target_idx, which point into the full channel list.
         self.mean = np.array([stats[c]["mean"] for c in CHANNELS], dtype=np.float32)
         self.stdev = np.array([stats[c]["std"] for c in CHANNELS], dtype=np.float32)
 
-        self.mean_geoinfo = np.array([self.floor_depth.mean()], dtype=np.float32)
-        self.stdev_geoinfo = np.array([self.floor_depth.std()], dtype=np.float32)
+        self.mean_geoinfo = np.array([self.floor_depth.mean()], dtype=np.float32)  # (1,)
+        self.stdev_geoinfo = np.array([self.floor_depth.std()], dtype=np.float32)  # (1,)
 
         if is_root():
             name = stream_info["name"]
@@ -196,28 +208,32 @@ class DataReaderMedSea(DataReaderTimestep):
             # Read each variable once for this day, then take the levels we
             # want out of it. One chunk on disk holds five levels, so reading
             # one level at a time would fetch the same chunk five times over.
+            # Each value is (levels, cells), or (1, cells) for a surface one.
             fields = {
                 var: self.ds[var].isel({TIME_DIM: int(t_idx)}).values.reshape(-1, NY * NX)
                 for var in {CHANNEL_VAR[c] for c in channels_idx}
             }
-            columns = [
+            # Pick the variable, then the level, then keep the sea cells only.
+            columns = [  # a list of (points,), one per channel
                 fields[CHANNEL_VAR[c]][CHANNEL_LEVEL[c]][self.sea_points] for c in channels_idx
             ]
-            blocks.append(np.stack(columns, axis=-1))
+            blocks.append(np.stack(columns, axis=-1))  # (points, channels)
 
-        data = np.vstack(blocks).astype(np.float32)
+        data = np.vstack(blocks).astype(np.float32)  # (days * points, channels)
 
         # Under the sea floor there is no value. We write the mean of the
         # channel, which the framework turns into exactly 0 when it normalises.
         # Writing a plain 0 here instead would mean a sea temperature of 0 C.
-        missing = ~np.isfinite(data)
+        missing = ~np.isfinite(data)  # (days * points, channels)
         data[missing] = np.broadcast_to(self.mean[channels_idx], data.shape)[missing]
 
-        latlon = np.stack([self.latitudes, self.longitudes], axis=-1)
-        coords = np.vstack((latlon,) * len(t_idxs))
+        # The same points come back every day, so coordinates and sea floor
+        # depth are simply repeated once per day.
+        latlon = np.stack([self.latitudes, self.longitudes], axis=-1)  # (points, 2)
+        coords = np.vstack((latlon,) * len(t_idxs))  # (days * points, 2)
 
-        geoinfos = np.vstack((self.floor_depth.reshape(-1, 1),) * len(t_idxs))
-        datetimes = np.repeat(self.times[t_idxs], self.n_points)
+        geoinfos = np.vstack((self.floor_depth.reshape(-1, 1),) * len(t_idxs))  # (days * points, 1)
+        datetimes = np.repeat(self.times[t_idxs], self.n_points)  # (days * points,)
 
         rd = ReaderData(coords=coords, geoinfos=geoinfos, data=data, datetimes=datetimes)
         check_reader_data(rd, dtr)

@@ -48,7 +48,7 @@ MedSea :
   # sit half a cell away and would need to be shifted first, which is still an
   # open question for this dataset, so they are left out.
   source : [
-    'sossheig',
+    'sossheig', 'sohefldo', 'sowaflup', 'sozotaux', 'sometauy',
     'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
     'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
   ]
