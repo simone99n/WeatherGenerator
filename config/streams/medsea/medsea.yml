@@ -1,0 +1,78 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Mediterranean Sea reanalysis (NEMO, 1/24 degree, daily means).
+#
+# Put the directory holding the stores in `data_paths` of the run config:
+#   data_paths : ['/work/cmcc/machine_learning/medformer/data/datasets/reanalysis/zarr']
+#
+# One reader is made per file in `filenames`, and they are read as one stream.
+# Shorten the list for a quick run.
+
+MedSea :
+  type : medsea
+  stream_id : 0
+  filenames : [
+    'reanalysis-1987.zarr', 'reanalysis-1988.zarr', 'reanalysis-1989.zarr',
+    'reanalysis-1990.zarr', 'reanalysis-1991.zarr', 'reanalysis-1992.zarr',
+    'reanalysis-1993.zarr', 'reanalysis-1994.zarr', 'reanalysis-1995.zarr',
+    'reanalysis-1996.zarr', 'reanalysis-1997.zarr', 'reanalysis-1998.zarr',
+    'reanalysis-1999.zarr', 'reanalysis-2000.zarr', 'reanalysis-2001.zarr',
+    'reanalysis-2002.zarr', 'reanalysis-2003.zarr', 'reanalysis-2004.zarr',
+    'reanalysis-2005.zarr', 'reanalysis-2006.zarr', 'reanalysis-2007.zarr',
+    'reanalysis-2008.zarr', 'reanalysis-2009.zarr', 'reanalysis-2010.zarr',
+    'reanalysis-2011.zarr', 'reanalysis-2012.zarr', 'reanalysis-2013.zarr',
+    'reanalysis-2014.zarr', 'reanalysis-2015.zarr', 'reanalysis-2016.zarr',
+    'reanalysis-2017.zarr', 'reanalysis-2018.zarr', 'reanalysis-2019.zarr',
+    'reanalysis-2020.zarr', 'reanalysis-2021.zarr',
+  ]
+
+  # Made once with make_medsea_norm_stats.py.
+  norm_stats : '/work/cmcc/machine_learning/medformer/data/medsea_norm_stats.json'
+
+  # A channel is a variable, and for the deep ones a variable at one depth.
+  # The 18 available depths in metres are:
+  #   1, 3, 5, 8, 11, 19, 30, 51, 73, 98, 153, 203, 250, 304, 399, 556, 756, 971
+  # so votemper_1m ... votemper_971m, and the same for vosaline, vozocrtx and
+  # vomecrty. Add or remove lines here to change what the model sees.
+  #
+  # We use six depths rather than all eighteen to keep the example small.
+  # sossheig, votemper and vosaline sit in the same place on the model grid.
+  # The currents (vozocrtx, vomecrty) and the wind stress (sozotaux, sometauy)
+  # sit half a cell away and would need to be shifted first, which is still an
+  # open question for this dataset, so they are left out.
+  source : [
+    'sossheig',
+    'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
+    'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
+  ]
+  target : [
+    'sossheig',
+    'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
+    'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
+  ]
+
+  loss_weight : 1.
+  token_size : 8
+  max_num_targets : -1
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 256
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1
