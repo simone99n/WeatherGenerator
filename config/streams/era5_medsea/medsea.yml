@@ -1,0 +1,75 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Mediterranean Sea reanalysis (NEMO, 1/24 degree, daily means), as the ocean
+# half of a combined ERA5 + MedSea training. See era5.yml next to this file for
+# the atmosphere half.
+#
+# Only 2021 is staged on Jupiter, under /e/scratch/weatherai/norberti1, so the
+# run config must keep all of its date ranges inside that year.
+
+MedSea :
+  type : medsea
+  # 1, because era5.yml in this directory already takes 0.
+  stream_id : 1
+  filenames : ['reanalysis-2021.zarr']
+
+  # Made once with make_medsea_norm_stats.py. Per variable AND per level: the
+  # standard deviation of temperature goes from 4.44 at the surface to 0.28 at
+  # 971 m, so a single value per variable would flatten the deep signal.
+  norm_stats : '/e/scratch/weatherai/norberti1/medsea_norm_stats.json'
+
+  # A channel is a variable, and for the deep ones a variable at one depth.
+  # The 18 available depths in metres are:
+  #   1, 3, 5, 8, 11, 19, 30, 51, 73, 98, 153, 203, 250, 304, 399, 556, 756, 971
+  # so votemper_1m ... votemper_971m, and the same for vosaline, vozocrtx and
+  # vomecrty. Six depths rather than all eighteen, to keep the run small.
+  #
+  # sossheig, sohefldo, sowaflup, votemper and vosaline sit on the T grid, where
+  # we want them. sozotaux and sometauy are the wind stress: they live half a
+  # cell away and would need to be shifted onto the T grid first, which is still
+  # an open question for this dataset. They are given to the model as source
+  # only, never as target, so the loss is never computed on a misplaced field.
+  source : [
+    'sossheig', 'sohefldo', 'sowaflup', 'sozotaux', 'sometauy',
+    'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
+    'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
+  ]
+  target : [
+    'sossheig',
+    'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
+    'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
+  ]
+
+  loss_weight : 1.
+
+  # The reader returns all 144990 sea points of the basin for every day, while
+  # ERA5 on o96 has about 40000 points for the whole globe. Without a cap the
+  # Mediterranean would dominate the target loss. 20000 is what era5.yml uses,
+  # so the two streams contribute a comparable number of target points.
+  max_num_targets : 20000
+
+  token_size : 8
+
+  # dim_embed matches era5.yml: both streams feed the same latent space.
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 512
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1
