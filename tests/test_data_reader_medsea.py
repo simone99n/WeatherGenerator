@@ -103,7 +103,14 @@ def store(tmp_path_factory):
     return path, stats_path, wet
 
 
-def _reader(store, source=None, target=None, window_hours=24, t_start="1987-01-02T00:00"):
+def _reader(
+    store,
+    source=None,
+    target=None,
+    geoinfo_channels=None,
+    window_hours=24,
+    t_start="1987-01-02T00:00",
+):
     path, stats_path, _wet = store
     stream_info = {
         "name": "MedSeaTest",
@@ -111,6 +118,10 @@ def _reader(store, source=None, target=None, window_hours=24, t_start="1987-01-0
         "target": target if target is not None else ["votemper_1m"],
         "norm_stats": str(stats_path),
     }
+    # Left out of stream_info entirely unless asked for, so that the tests also
+    # cover the default: a config that says nothing about geoinfos.
+    if geoinfo_channels is not None:
+        stream_info["geoinfo_channels"] = geoinfo_channels
     tw = TimeWindowHandler(
         np.datetime64(t_start),
         np.datetime64("1987-01-05T00:00"),
@@ -154,16 +165,6 @@ def test_only_sea_points_are_returned(store):
     assert reader.n_points < NY * NX
 
 
-def test_sea_floor_depth_matches_the_mask(store):
-    _path, _stats, wet = store
-    reader = _reader(store)
-
-    n_levels = wet.reshape(N_LEVELS, -1).sum(axis=0)[reader.sea_points]
-    expected = np.array(DEPTH_M, dtype=np.float32)[n_levels - 1]
-
-    np.testing.assert_allclose(reader.floor_depth, expected)
-
-
 def test_get_source_shapes_and_time(store):
     reader = _reader(store)
 
@@ -171,7 +172,7 @@ def test_get_source_shapes_and_time(store):
 
     assert rdata.data.shape == (reader.n_points, 3)
     assert rdata.coords.shape == (reader.n_points, 2)
-    assert rdata.geoinfos.shape == (reader.n_points, 1)
+    assert rdata.geoinfos.shape == (reader.n_points, 0)
     # The window starting 1987-01-02T00:00 covers the field labelled at noon.
     assert (rdata.datetimes == np.datetime64("1987-01-02T12:00")).all()
 
@@ -192,6 +193,7 @@ def test_values_match_the_store(store):
 
 
 def test_below_the_sea_floor_normalises_to_zero(store):
+    _path, _stats, wet = store
     reader = _reader(store)
 
     rdata = reader.get_source(np.int64(0))
@@ -201,7 +203,8 @@ def test_below_the_sea_floor_normalises_to_zero(store):
 
     normalized = reader.normalize_source_channels(rdata.data.copy())
     deep = reader.source_channels.index("votemper_971m")
-    dry = reader.floor_depth < DEPTH_M[-1]
+    # Columns whose deepest level is land: the last level has no value there.
+    dry = ~wet.reshape(N_LEVELS, -1)[-1][reader.sea_points]
 
     assert dry.any(), "the synthetic mask must have columns shallower than the last level"
     np.testing.assert_allclose(normalized[dry, deep], 0.0, atol=1e-5)
@@ -217,6 +220,58 @@ def test_multi_day_window_stacks_days(store):
     assert len(np.unique(rdata.datetimes)) == 2
     # The same points come back each day, so coordinates simply repeat.
     np.testing.assert_allclose(rdata.coords[: reader.n_points], rdata.coords[reader.n_points :])
+
+
+def test_geoinfos_default_to_none(store):
+    reader = _reader(store)
+
+    assert reader.geoinfo_channels == []
+    assert reader.get_geoinfo_size() == 0
+    assert reader.get_source(np.int64(0)).geoinfos.shape == (reader.n_points, 0)
+
+
+def test_geoinfos_are_read_from_the_dataset(store):
+    path, _stats, wet = store
+    reader = _reader(store, source=["votemper_1m"], geoinfo_channels=["sossheig"])
+
+    rdata = reader.get_source(np.int64(0))
+
+    assert rdata.geoinfos.shape == (reader.n_points, 1)
+
+    ds = xr.open_zarr(path, consolidated=True, chunks=None, zarr_format=2)
+    # Window index 0 is 1987-01-02, i.e. day 1 of the store.
+    expected = ds["sossheig"].isel({TIME_DIM: 1}).values.reshape(-1)[np.flatnonzero(wet[0])]
+    np.testing.assert_allclose(rdata.geoinfos[:, 0], expected, rtol=1e-6)
+
+    # The statistics come from the same file as the ones for the data channels.
+    sossheig = CHANNELS.index("sossheig")
+    np.testing.assert_allclose(reader.mean_geoinfo, [reader.mean[sossheig]])
+    np.testing.assert_allclose(reader.stdev_geoinfo, [reader.stdev[sossheig]])
+
+
+def test_a_channel_can_be_data_and_geoinfo_at_once(store):
+    reader = _reader(store, source=["sossheig", "votemper_1m"], geoinfo_channels=["sossheig"])
+
+    rdata = reader.get_source(np.int64(0))
+
+    column = reader.source_channels.index("sossheig")
+    np.testing.assert_allclose(rdata.geoinfos[:, 0], rdata.data[:, column])
+
+
+def test_a_deep_geoinfo_keeps_every_point(store):
+    """A NaN geoinfo makes the framework drop the point, so geoinfos are filled too."""
+    reader = _reader(store, geoinfo_channels=["votemper_971m"])
+
+    rdata = reader.get_source(np.int64(0))
+
+    assert np.isfinite(rdata.geoinfos).all()
+    assert rdata.remove_nan_coords_and_geoinfos().len() == reader.n_points
+
+
+def test_unknown_geoinfo_channel_is_refused(store):
+    # Indexing into the channel list refuses it, as it does for source and target.
+    with pytest.raises(ValueError, match="mixed_layer_depth"):
+        _reader(store, geoinfo_channels=["mixed_layer_depth"])
 
 
 def test_window_outside_the_store_is_empty(store):

@@ -1,4 +1,4 @@
-# (C) Copyright 2025 WeatherGenerator contributors.
+# (C) Copyright 2026 WeatherGenerator contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -10,8 +10,10 @@
 """
 Data reader for the Mediterranean Sea reanalysis (NEMO, 1/24 degree).
 
-Nine ocean variables as daily means, 18 levels down to 971 m, one Zarr store per
-year from 1987 to 2021. There is no land-sea mask in the file: land is NaN.
+Nine ocean variables, 18 levels down to 971 m, one Zarr store per year from 1987
+to 2021 (must change). The time step is whatever the file says it is,
+daily means in this archive, so 3-hourly or multi-day output reads the same way.
+There is no land-sea mask in the file: land is NaN.
 """
 
 import json
@@ -34,39 +36,30 @@ from weathergen.utils.distributed import is_root
 
 _logger = logging.getLogger(__name__)
 
-# The grid is regular, but the nav_lat / nav_lon arrays stored in the file are
-# zero on 41% of the cells (all of them on land), so anything that takes their
-# min or max gets nonsense. We rebuild the coordinates from these four numbers
-# instead. Lesson: always look at the min and max of your coordinates.
+# The grid is regular
+# nav_lat and nav_lon can be contain the sea-over-land mask
 NY, NX = 380, 1016
 DXY = 1.0 / 24.0
 LAT0, LON0 = 30.1875, -6.0
 
-# The 18 depths in metres. They are not evenly spaced.
 DEPTH_M = [
     1.0182366, 3.1657474, 5.4649634, 7.9203773, 10.536604, 19.398211,
     29.885643, 51.379860, 72.623688, 97.928726, 153.43285, 203.17044,
     249.91585, 303.56131, 398.54471, 556.40887, 756.19604, 971.07788,
 ]  # fmt: skip
 
-# Variables that exist only at the surface: sea surface height, net heat flux,
-# net water flux, and the two components of the wind stress.
 SURFACE_VARS = ["sossheig", "sohefldo", "sowaflup", "sozotaux", "sometauy"]
 
-# Variables that have all 18 levels: temperature, salinity, and the two
-# components of the current.
-#
 # Careful with the currents. The model stores them half a cell away from the
 # temperature (about 1.9 km), and so it does for the wind stress above. Stacking
 # them with temperature as if they were in the same place puts a small error
-# into every gradient the model sees. Which way to shift them back is not yet
-# confirmed for this dataset, so the example config uses only the variables that
-# are already in the right place: votemper, vosaline and sossheig.
+# into every gradient the model sees.
 VOLUME_VARS = ["votemper", "vosaline", "vozocrtx", "vomecrty"]
 
-# The file has three time axes. time_counter is the middle of the day that each
-# average covers, which is the right label for a daily mean. time_instant is the
-# same thing plus 12 hours, the end of the day. We use time_counter.
+# time_counter is the centre of the interval that each average covers,
+#   which is the right label for a mean over that interval.
+# time_instant is the end of the same interval, half a time step later: 12 hours
+#   for the daily means of this archive.
 TIME_DIM = "time_counter"
 
 # Sea cells at the surface, out of the 380 * 1016 = 386080 cells of the box.
@@ -79,8 +72,9 @@ N_SEA_POINTS = 144990
 #   cells        the grid flattened, rows * cols, sea and land together
 #   levels       the 18 depths
 #   points       the sea cells only, which is all this reader returns
-#   days         the days of the time window being asked for
+#   steps        the time steps of the window being asked for
 #   channels     the channels being asked for
+#   geoinfos     the geoinfo channels, one column each
 
 # One channel per surface variable, plus one per level for the deep ones. The
 # name carries the depth in metres, rounded: votemper_1m ... votemper_971m.
@@ -106,14 +100,15 @@ class DataReaderMedSea(DataReaderTimestep):
         stream_info: dict,
         stage: Stage,
     ) -> None:
-        # open_zarr reads the metadata only. No data is loaded here, and one
-        # reader handles one year: the framework makes one per file in the list.
+        # *** STEP 1: OPEN DATASET METADATA *** #
+        # open_zarr reads the metadata only. No data is loaded here
         self.ds = xr.open_zarr(filename, consolidated=True, chunks=None, zarr_format=2)
-        self.times = self.ds.coords[TIME_DIM].values  # (days in this store,)
 
+        # *** STEP 2: TIME COORDINATE HANDLING *** #
+        self.times = self.ds.coords[TIME_DIM].values  # (steps in this store,)
         data_start_time = self.times[0]
         data_end_time = self.times[-1]
-        period = self.times[1] - self.times[0]
+        period = self.times[1] - self.times[0]  # time step in the dataset
 
         if tw_handler.t_start >= data_end_time or tw_handler.t_end <= data_start_time:
             name = stream_info["name"]
@@ -125,16 +120,19 @@ class DataReaderMedSea(DataReaderTimestep):
         super().__init__(tw_handler, stream_info, data_start_time, data_end_time, period)
         self.len = len(self.times)
 
+        # *** STEP 3: LAT-LON GRID *** #
         lat = LAT0 + np.arange(NY, dtype=np.float32) * DXY  # (rows,)
         lon = LON0 + np.arange(NX, dtype=np.float32) * DXY  # (cols,)
         lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")  # both (rows, cols)
 
-        # The land-sea mask is nowhere in the file: it is only the pattern of
-        # NaN in the data. It never changes with time, so we read it once, here,
-        # instead of looking for NaN in every sample.
+        # *** STEP 4: LAND MASK *** #
+        # It never changes with time, so we read it once, here, instead of
+        # looking for NaN in every sample.
+        # NaN --> Land mask
         wet = np.isfinite(self.ds["votemper"].isel({TIME_DIM: 0}).values)  # (levels, rows, cols)
         wet = wet.reshape(len(DEPTH_M), NY * NX)  # (levels, cells)
 
+        # *** STEP 5: SEA POINTS AND MASKED COORDINATES *** #
         # We return one point per sea cell. Land is simply not in the list, so
         # the model never sees it: 386080 cells become 144990 points.
         self.sea_points = np.flatnonzero(wet[0])  # (points,), an index into cells
@@ -142,23 +140,20 @@ class DataReaderMedSea(DataReaderTimestep):
         self.longitudes = lon_grid.reshape(-1)[self.sea_points]  # (points,)
         self.n_points = len(self.sea_points)
 
-        # A cell that is sea at one level is sea at every level above it, so
-        # counting the sea levels of a column gives the depth of its floor. This
-        # is how the model is told where the deep channels have no data.
-        n_levels = wet.sum(axis=0)[self.sea_points]  # (points,)
-        self.floor_depth = np.array(DEPTH_M, dtype=np.float32)[n_levels - 1]  # (points,)
-
+        # *** STEP 6: CHANNEL and GEOINFOS INDEXING *** #
         self.source_channels = stream_info.get("source", CHANNELS)
         self.source_idx = [CHANNELS.index(c) for c in self.source_channels]
 
         self.target_channels = stream_info.get("target", CHANNELS)
         self.target_idx = [CHANNELS.index(c) for c in self.target_channels]
 
-        self.geoinfo_channels = ["sea_floor_depth"]
-        self.geoinfo_idx = [0]
+        self.geoinfo_channels = stream_info.get("geoinfo_channels", [])
+        self.geoinfo_idx = [CHANNELS.index(c) for c in self.geoinfo_channels]
 
+        # *** STEP 7: CHANNEL WEIGHTS *** #
         self.target_channel_weights = self.parse_target_channel_weights()
 
+        # *** STEP 8: NORMALISATION STATISTICS *** #
         # Mean and standard deviation per channel, so per variable AND per
         # level: in the Mediterranean the temperature goes from 15-28 C at the
         # surface to about 13.5 C below 500 m, and one mean per variable would
@@ -175,15 +170,20 @@ class DataReaderMedSea(DataReaderTimestep):
         self.mean = np.array([stats[c]["mean"] for c in CHANNELS], dtype=np.float32)
         self.stdev = np.array([stats[c]["std"] for c in CHANNELS], dtype=np.float32)
 
-        self.mean_geoinfo = np.array([self.floor_depth.mean()], dtype=np.float32)  # (1,)
-        self.stdev_geoinfo = np.array([self.floor_depth.std()], dtype=np.float32)  # (1,)
+        # Both (geoinfos,), already the subset the config asked for:
+        # normalize_geoinfos indexes these by position, while mean and stdev
+        # above are indexed by channel.
+        self.mean_geoinfo = self.mean[self.geoinfo_idx]
+        self.stdev_geoinfo = self.stdev[self.geoinfo_idx]
 
+        # *** STEP 9: LOGGER OUTPUT *** #
         if is_root():
             name = stream_info["name"]
             if self.n_points != N_SEA_POINTS:
                 _logger.warning(f"{name}: {self.n_points} sea points, expected {N_SEA_POINTS}.")
             _logger.info(f"{name}: source channels: {self.source_channels}")
             _logger.info(f"{name}: target channels: {self.target_channels}")
+            _logger.info(f"{name}: geoinfo channels: {self.geoinfo_channels}")
 
     @override
     def init_empty(self) -> None:
@@ -196,6 +196,7 @@ class DataReaderMedSea(DataReaderTimestep):
 
     @override
     def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
+        # *** STEP 11: GET DATASET INDEXES FOR THIS TIME WINDOW *** #
         (t_idxs, dtr) = self._get_dataset_idxs(idx)
 
         if self.len == 0 or len(t_idxs) == 0:
@@ -203,15 +204,20 @@ class DataReaderMedSea(DataReaderTimestep):
                 num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
             )
 
+        # ** STEP 12: READ DATA FROM DISK *** #
         blocks = []
+        geoinfo_blocks = []
         for t_idx in t_idxs:
-            # Read each variable once for this day, then take the levels we
-            # want out of it. One chunk on disk holds five levels, so reading
+            # Read each variable once for this time step, then take the levels
+            # we want out of it. One chunk on disk holds five levels, so reading
             # one level at a time would fetch the same chunk five times over.
             # Each value is (levels, cells), or (1, cells) for a surface one.
+            # The geoinfo channels are read here too, so that a variable needed
+            # by both is fetched once, but they never share a column with the
+            # data: they are stacked on their own, below.
             fields = {
                 var: self.ds[var].isel({TIME_DIM: int(t_idx)}).values.reshape(-1, NY * NX)
-                for var in {CHANNEL_VAR[c] for c in channels_idx}
+                for var in {CHANNEL_VAR[c] for c in [*channels_idx, *self.geoinfo_idx]}
             }
             # Pick the variable, then the level, then keep the sea cells only.
             columns = [  # a list of (points,), one per channel
@@ -219,21 +225,41 @@ class DataReaderMedSea(DataReaderTimestep):
             ]
             blocks.append(np.stack(columns, axis=-1))  # (points, channels)
 
-        data = np.vstack(blocks).astype(np.float32)  # (days * points, channels)
+            if self.geoinfo_idx:
+                geoinfo_columns = [  # a list of (points,), one per geoinfo
+                    fields[CHANNEL_VAR[c]][CHANNEL_LEVEL[c]][self.sea_points]
+                    for c in self.geoinfo_idx
+                ]
+                geoinfo_blocks.append(np.stack(geoinfo_columns, axis=-1))  # (points, geoinfos)
+
+        data = np.vstack(blocks).astype(np.float32)  # (steps * points, channels)
+
+        # (steps * points, geoinfos), with no column at all when the config asked
+        # for no geoinfo, which is what most of the other readers return.
+        geoinfos = (
+            np.vstack(geoinfo_blocks).astype(np.float32)
+            if geoinfo_blocks
+            else np.zeros((len(data), 0), dtype=np.float32)
+        )
 
         # Under the sea floor there is no value. We write the mean of the
         # channel, which the framework turns into exactly 0 when it normalises.
         # Writing a plain 0 here instead would mean a sea temperature of 0 C.
-        missing = ~np.isfinite(data)  # (days * points, channels)
+        missing = ~np.isfinite(data)  # (steps * points, channels)
         data[missing] = np.broadcast_to(self.mean[channels_idx], data.shape)[missing]
 
-        # The same points come back every day, so coordinates and sea floor
-        # depth are simply repeated once per day.
-        latlon = np.stack([self.latitudes, self.longitudes], axis=-1)  # (points, 2)
-        coords = np.vstack((latlon,) * len(t_idxs))  # (days * points, 2)
+        # The same for the geoinfos, where it also keeps the point: the
+        # framework drops every point whose geoinfos are not all finite, so a
+        # deep channel used as a geoinfo would delete the sea floor in silence.
+        missing = ~np.isfinite(geoinfos)  # (steps * points, geoinfos)
+        geoinfos[missing] = np.broadcast_to(self.mean[self.geoinfo_idx], geoinfos.shape)[missing]
 
-        geoinfos = np.vstack((self.floor_depth.reshape(-1, 1),) * len(t_idxs))  # (days * points, 1)
-        datetimes = np.repeat(self.times[t_idxs], self.n_points)  # (days * points,)
+        # The same points come back at every time step, so the coordinates are
+        # simply repeated once per step.
+        latlon = np.stack([self.latitudes, self.longitudes], axis=-1)  # (points, 2)
+        coords = np.vstack((latlon,) * len(t_idxs))  # (steps * points, 2)
+
+        datetimes = np.repeat(self.times[t_idxs], self.n_points)  # (steps * points,)
 
         rd = ReaderData(coords=coords, geoinfos=geoinfos, data=data, datetimes=datetimes)
         check_reader_data(rd, dtr)

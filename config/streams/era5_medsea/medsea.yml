@@ -47,6 +47,12 @@ MedSea :
     'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
   ]
 
+  # Geoinfos are channels of this dataset, named exactly like the ones above and
+  # read the same way. Empty for now: the store holds no static field, no
+  # bathymetry and no land-sea mask, and a static field is what a geoinfo is
+  # usually for. Adding one means writing it into the store first.
+  geoinfo_channels : []
+
   loss_weight : 1.
 
   # The reader returns all 144990 sea points of the basin for every day, while

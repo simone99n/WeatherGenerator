@@ -18,20 +18,7 @@
 MedSea :
   type : medsea
   stream_id : 0
-  filenames : [
-    'reanalysis-1987.zarr', 'reanalysis-1988.zarr', 'reanalysis-1989.zarr',
-    'reanalysis-1990.zarr', 'reanalysis-1991.zarr', 'reanalysis-1992.zarr',
-    'reanalysis-1993.zarr', 'reanalysis-1994.zarr', 'reanalysis-1995.zarr',
-    'reanalysis-1996.zarr', 'reanalysis-1997.zarr', 'reanalysis-1998.zarr',
-    'reanalysis-1999.zarr', 'reanalysis-2000.zarr', 'reanalysis-2001.zarr',
-    'reanalysis-2002.zarr', 'reanalysis-2003.zarr', 'reanalysis-2004.zarr',
-    'reanalysis-2005.zarr', 'reanalysis-2006.zarr', 'reanalysis-2007.zarr',
-    'reanalysis-2008.zarr', 'reanalysis-2009.zarr', 'reanalysis-2010.zarr',
-    'reanalysis-2011.zarr', 'reanalysis-2012.zarr', 'reanalysis-2013.zarr',
-    'reanalysis-2014.zarr', 'reanalysis-2015.zarr', 'reanalysis-2016.zarr',
-    'reanalysis-2017.zarr', 'reanalysis-2018.zarr', 'reanalysis-2019.zarr',
-    'reanalysis-2020.zarr', 'reanalysis-2021.zarr',
-  ]
+  filenames : ['reanalysis-2021.zarr']
 
   # Made once with make_medsea_norm_stats.py.
   norm_stats : '/work/cmcc/machine_learning/medformer/data/medsea_norm_stats.json'
@@ -57,6 +44,12 @@ MedSea :
     'votemper_1m', 'votemper_30m', 'votemper_98m', 'votemper_250m', 'votemper_971m',
     'vosaline_1m', 'vosaline_30m', 'vosaline_98m', 'vosaline_250m', 'vosaline_971m',
   ]
+
+  # Geoinfos are channels of this dataset, named exactly like the ones above and
+  # read the same way. Empty for now: the store holds no static field, no
+  # bathymetry and no land-sea mask, and a static field is what a geoinfo is
+  # usually for. Adding one means writing it into the store first.
+  geoinfo_channels : []
 
   loss_weight : 1.
   token_size : 8
