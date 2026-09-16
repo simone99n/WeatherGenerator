@@ -76,6 +76,9 @@ N_SEA_POINTS = 144990
 #   channels     the channels being asked for
 #   geoinfos     the geoinfo channels, one column each
 
+# The depth as it is written in a channel name, one per level.
+DEPTH_NAMES = [round(depth) for depth in DEPTH_M]
+
 # One channel per surface variable, plus one per level for the deep ones. The
 # name carries the depth in metres, rounded: votemper_1m ... votemper_971m.
 CHANNELS: list[str] = []
@@ -86,10 +89,30 @@ for _var in SURFACE_VARS:
     CHANNEL_VAR.append(_var)
     CHANNEL_LEVEL.append(0)
 for _var in VOLUME_VARS:
-    for _level, _depth in enumerate(DEPTH_M):
-        CHANNELS.append(f"{_var}_{round(_depth)}m")
+    for _level, _depth in enumerate(DEPTH_NAMES):
+        CHANNELS.append(f"{_var}_{_depth}m")
         CHANNEL_VAR.append(_var)
         CHANNEL_LEVEL.append(_level)
+
+
+def _channel_idxs(names: list[str], field: str, stream_name: str) -> list[int]:
+    """
+    Turn channel names from the stream config into indices into CHANNELS.
+
+    CHANNELS is the same for every store of the archive, so a name that is not
+    in it is a typo in the config rather than a store that happens to lack the
+    field. Say so here, and say which names do exist, instead of leaving
+    list.index to raise "'x' is not in list" with no stream and no list.
+    """
+    unknown = [c for c in names if c not in CHANNELS]
+    assert not unknown, (
+        f"{stream_name}: {field} lists channel(s) {unknown} that this dataset does not have. "
+        f"Available: {', '.join(SURFACE_VARS)}, and <var>_<depth>m for each of "
+        f"{', '.join(VOLUME_VARS)} with <depth> one of "
+        f"{', '.join(str(depth) for depth in DEPTH_NAMES)}."
+    )
+
+    return [CHANNELS.index(c) for c in names]
 
 
 class DataReaderMedSea(DataReaderTimestep):
@@ -141,14 +164,15 @@ class DataReaderMedSea(DataReaderTimestep):
         self.n_points = len(self.sea_points)
 
         # *** STEP 6: CHANNEL and GEOINFOS INDEXING *** #
+        name = stream_info["name"]
+
         self.source_channels = stream_info.get("source", CHANNELS)
-        self.source_idx = [CHANNELS.index(c) for c in self.source_channels]
-
         self.target_channels = stream_info.get("target", CHANNELS)
-        self.target_idx = [CHANNELS.index(c) for c in self.target_channels]
-
         self.geoinfo_channels = stream_info.get("geoinfo_channels", [])
-        self.geoinfo_idx = [CHANNELS.index(c) for c in self.geoinfo_channels]
+
+        self.source_idx = _channel_idxs(self.source_channels, "source", name)
+        self.target_idx = _channel_idxs(self.target_channels, "target", name)
+        self.geoinfo_idx = _channel_idxs(self.geoinfo_channels, "geoinfo_channels", name)
 
         # *** STEP 7: CHANNEL WEIGHTS *** #
         self.target_channel_weights = self.parse_target_channel_weights()
@@ -178,7 +202,6 @@ class DataReaderMedSea(DataReaderTimestep):
 
         # *** STEP 9: LOGGER OUTPUT *** #
         if is_root():
-            name = stream_info["name"]
             if self.n_points != N_SEA_POINTS:
                 _logger.warning(f"{name}: {self.n_points} sea points, expected {N_SEA_POINTS}.")
             _logger.info(f"{name}: source channels: {self.source_channels}")
@@ -253,6 +276,8 @@ class DataReaderMedSea(DataReaderTimestep):
         # deep channel used as a geoinfo would delete the sea floor in silence.
         missing = ~np.isfinite(geoinfos)  # (steps * points, geoinfos)
         geoinfos[missing] = np.broadcast_to(self.mean[self.geoinfo_idx], geoinfos.shape)[missing]
+        # NOTE sto rimpiendo con la media ma magari voglio scartare il punto
+        # (remove_nan_coords_and_geoinfos)
 
         # The same points come back at every time step, so the coordinates are
         # simply repeated once per step.

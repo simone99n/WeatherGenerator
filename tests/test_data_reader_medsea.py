@@ -269,9 +269,12 @@ def test_a_deep_geoinfo_keeps_every_point(store):
 
 
 def test_unknown_geoinfo_channel_is_refused(store):
-    # Indexing into the channel list refuses it, as it does for source and target.
-    with pytest.raises(ValueError, match="mixed_layer_depth"):
+    with pytest.raises(AssertionError, match="mixed_layer_depth") as excinfo:
         _reader(store, geoinfo_channels=["mixed_layer_depth"])
+
+    # The message must name the field it came from and the channels that exist.
+    assert "geoinfo_channels" in str(excinfo.value)
+    assert "votemper" in str(excinfo.value)
 
 
 def test_window_outside_the_store_is_empty(store):
