@@ -201,6 +201,20 @@ def provenance(stores: list[Path], max_steps: int | None = None) -> dict[str, ND
     }
 
 
+def as_npz(
+    stats: dict[str, dict[str, NDArray]], stores: list[Path], max_steps: int | None = None
+) -> dict[str, NDArray]:
+    """Flatten the statistics into the arrays medsea_write_stats.py expects."""
+
+    arrays = {f"{key}_{var}": stats[var][key] for var in VARS for key in STATISTICS}
+    for dim in DEPTH_DIMS:
+        arrays[f"depth_{dim}"] = next(
+            stats[var]["depth"] for var in VOLUME_VARS if DEPTH_DIM[var] == dim
+        )
+
+    return arrays | provenance(stores, max_steps=max_steps)
+
+
 def _log_table(stats: dict[str, dict[str, NDArray]]) -> None:
     """One line per variable and level, so the numbers can be eyeballed."""
 
@@ -248,12 +262,7 @@ def main() -> None:
         _logger.info("No --out given, nothing written.")
         return
 
-    arrays = {f"{key}_{var}": stats[var][key] for var in VARS for key in STATISTICS}
-    for dim in DEPTH_DIMS:
-        depth = next(stats[var]["depth"] for var in VOLUME_VARS if DEPTH_DIM[var] == dim)
-        arrays[f"depth_{dim}"] = depth
-    arrays |= provenance(args.stores, max_steps=args.max_steps)
-
+    arrays = as_npz(stats, args.stores, max_steps=args.max_steps)
     np.savez(args.out, **arrays)
     _logger.info(f"Wrote {len(arrays)} arrays to {args.out}")
 
