@@ -18,10 +18,10 @@
 MedSea :
   type : medsea
   stream_id : 0
-  filenames : ['reanalysis-2021.zarr']
-
-  # Made once with make_medsea_norm_stats.py.
-  norm_stats : '/work/cmcc/machine_learning/medformer/data/medsea_norm_stats.json'
+  # The store carries its own normalisation statistics, in its mean and std
+  # groups: no norm_stats key here, and a store without those groups is
+  # refused by the reader. Written with medsea_stats.py + medsea_write_stats.py.
+  filenames : ['reanalysis-2021_v2.zarr']
 
   # A channel is a variable, and for the deep ones a variable at one depth.
   # The 18 available depths in metres are:

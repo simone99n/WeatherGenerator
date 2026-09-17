@@ -18,12 +18,13 @@ MedSea :
   type : medsea
   # 1, because era5.yml in this directory already takes 0.
   stream_id : 1
-  filenames : ['reanalysis-2021.zarr']
-
-  # Made once with make_medsea_norm_stats.py. Per variable AND per level: the
-  # standard deviation of temperature goes from 4.44 at the surface to 0.28 at
-  # 971 m, so a single value per variable would flatten the deep signal.
-  norm_stats : '/e/scratch/weatherai/norberti1/medsea_norm_stats.json'
+  # The store carries its own normalisation statistics, in its mean and std
+  # groups: no norm_stats key here, and a store without those groups is
+  # refused by the reader. They are per variable AND per level, because the
+  # standard deviation of temperature goes from 4.55 at the surface to 0.28 at
+  # 971 m and a single value per variable would flatten the deep signal.
+  # Written with medsea_stats.py + medsea_write_stats.py.
+  filenames : ['reanalysis-2021_v2.zarr']
 
   # A channel is a variable, and for the deep ones a variable at one depth.
   # The 18 available depths in metres are:

@@ -12,11 +12,11 @@ Tests for the Mediterranean reanalysis reader.
 
 The real archive is 1.38 TiB and lives on the CMCC machines, so these tests
 build a tiny Zarr store with the same structure: the same variable names, three
-identical depth coordinates, time_counter at noon, and land as NaN with a
-nested mask.
+identical depth coordinates, time_counter at noon, land as NaN with a nested
+mask, and the mean and std groups the reader takes its statistics from.
 """
 
-import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -36,6 +36,7 @@ from weathergen.readers_extra.data_reader_medsea import (
     VOLUME_VARS,
     DataReaderMedSea,
 )
+from weathergen.readers_extra.medsea_write_stats import write_stats
 
 N_DAYS = 4
 N_LEVELS = len(DEPTH_M)
@@ -96,11 +97,51 @@ def store(tmp_path_factory):
     )
     ds.to_zarr(path, consolidated=True, zarr_format=2)
 
-    stats_path = path.parent / "medsea_norm_stats.json"
-    stats = {c: {"mean": float(10 * CHANNEL_LEVEL[i]), "std": 1.0} for i, c in enumerate(CHANNELS)}
-    stats_path.write_text(json.dumps(stats))
+    # The statistics of this store are known exactly: every level was offset by
+    # 10 * level and the noise has unit deviation. They go in through the real
+    # writer, so the test exercises that code and not a copy of it. The mean of
+    # a surface variable is exactly 0.0, which is also the regression against
+    # fill_value 0 reading a zero statistic back as NaN.
+    write_stats(path, _analytic_stats(path), force=True)
 
-    return path, stats_path, wet
+    return path, wet
+
+
+def _analytic_stats(store: Path) -> dict[str, NDArray]:
+    """The .npz that medsea_stats.py would write for this synthetic store."""
+
+    stats: dict[str, NDArray] = {}
+    for var in [*SURFACE_VARS, *VOLUME_VARS]:
+        levels = N_LEVELS if var in VOLUME_VARS else 1
+        shape = (levels,) if var in VOLUME_VARS else ()
+        stats[f"mean_{var}"] = (10.0 * np.arange(levels)).reshape(shape)
+        stats[f"std_{var}"] = np.ones(levels).reshape(shape)
+        stats[f"count_{var}"] = np.full(levels, 1000, dtype=np.int64).reshape(shape)
+    for dim in ("deptht", "depthu", "depthv"):
+        stats[f"depth_{dim}"] = np.array(DEPTH_M, dtype=np.float64)
+
+    return stats | {
+        "stores": np.array([str(store)]),
+        "time_first": np.array("1987-01-01T12:00:00"),
+        "time_last": np.array("1987-01-04T12:00:00"),
+        "n_time_steps": np.array(N_DAYS),
+    }
+
+
+@pytest.fixture(scope="module")
+def store_without_stats(tmp_path_factory):
+    """A store the writer never touched: votemper only, which is all __init__ reads."""
+
+    path = tmp_path_factory.mktemp("medsea_bare") / "reanalysis-1987.zarr"
+    times = np.datetime64("1987-01-01T12:00") + np.arange(2) * np.timedelta64(1, "D")
+    field = np.zeros((2, N_LEVELS, NY, NX), dtype=np.float32)
+
+    xr.Dataset(
+        {"votemper": ((TIME_DIM, "deptht", "y", "x"), field)},
+        coords={TIME_DIM: times, "deptht": np.array(DEPTH_M, dtype=np.float32)},
+    ).to_zarr(path, consolidated=True, zarr_format=2)
+
+    return path
 
 
 def _reader(
@@ -111,12 +152,11 @@ def _reader(
     window_hours=24,
     t_start="1987-01-02T00:00",
 ):
-    path, stats_path, _wet = store
+    path, _wet = store
     stream_info = {
         "name": "MedSeaTest",
         "source": source if source is not None else ["sossheig", "votemper_1m", "votemper_971m"],
         "target": target if target is not None else ["votemper_1m"],
-        "norm_stats": str(stats_path),
     }
     # Left out of stream_info entirely unless asked for, so that the tests also
     # cover the default: a config that says nothing about geoinfos.
@@ -158,7 +198,7 @@ def test_coordinates_are_rebuilt_not_read(store):
 
 
 def test_only_sea_points_are_returned(store):
-    _path, _stats, wet = store
+    _path, wet = store
     reader = _reader(store)
 
     assert reader.n_points == int(wet[0].sum())
@@ -178,7 +218,7 @@ def test_get_source_shapes_and_time(store):
 
 
 def test_values_match_the_store(store):
-    path, _stats, wet = store
+    path, wet = store
     reader = _reader(store)
 
     rdata = reader.get_source(np.int64(0))
@@ -193,7 +233,7 @@ def test_values_match_the_store(store):
 
 
 def test_below_the_sea_floor_normalises_to_zero(store):
-    _path, _stats, wet = store
+    _path, wet = store
     reader = _reader(store)
 
     rdata = reader.get_source(np.int64(0))
@@ -231,7 +271,7 @@ def test_geoinfos_default_to_none(store):
 
 
 def test_geoinfos_are_read_from_the_dataset(store):
-    path, _stats, wet = store
+    path, wet = store
     reader = _reader(store, source=["votemper_1m"], geoinfo_channels=["sossheig"])
 
     rdata = reader.get_source(np.int64(0))
@@ -278,12 +318,11 @@ def test_unknown_geoinfo_channel_is_refused(store):
 
 
 def test_window_outside_the_store_is_empty(store):
-    path, stats_path, _wet = store
+    path, _wet = store
     stream_info = {
         "name": "MedSeaTest",
         "source": ["sossheig"],
         "target": ["sossheig"],
-        "norm_stats": str(stats_path),
     }
     tw = TimeWindowHandler(
         np.datetime64("1990-01-01T00:00"),
@@ -297,14 +336,8 @@ def test_window_outside_the_store_is_empty(store):
     assert reader.get_source(np.int64(0)).is_empty()
 
 
-def test_missing_statistics_say_how_to_make_them(store):
-    path, _stats, _wet = store
-    stream_info = {
-        "name": "MedSeaTest",
-        "source": ["sossheig"],
-        "target": ["sossheig"],
-        "norm_stats": str(path.parent / "does_not_exist.json"),
-    }
+def test_a_store_without_statistics_says_how_to_make_them(store_without_stats):
+    stream_info = {"name": "MedSeaTest", "source": ["votemper_1m"], "target": ["votemper_1m"]}
     tw = TimeWindowHandler(
         np.datetime64("1987-01-02T00:00"),
         np.datetime64("1987-01-05T00:00"),
@@ -312,8 +345,37 @@ def test_missing_statistics_say_how_to_make_them(store):
         np.timedelta64(24, "h"),
     )
 
-    with pytest.raises(AssertionError, match="make_medsea_norm_stats"):
-        DataReaderMedSea(tw, path, stream_info, stage="train")
+    with pytest.raises(AssertionError, match="medsea_write_stats"):
+        DataReaderMedSea(tw, store_without_stats, stream_info, stage="train")
+
+
+def test_statistics_come_from_the_store_groups(store):
+    path, _wet = store
+    reader = _reader(store)
+
+    means = xr.open_zarr(path, group="mean", consolidated=True, chunks=None, zarr_format=2)
+
+    # A level of a volume variable, and the 0-d statistic of a surface one:
+    # np.atleast_1d in the reader is what makes the second one work.
+    deep = CHANNELS.index("votemper_971m")
+    assert reader.mean[deep] == np.float32(means["votemper"].values[N_LEVELS - 1])
+    assert reader.mean[CHANNELS.index("sossheig")] == np.float32(means["sossheig"].values)
+    # The synthetic store was built with every level offset by 10 * level.
+    assert reader.mean[deep] == np.float32(10.0 * (N_LEVELS - 1))
+
+
+def test_a_channel_with_no_variation_is_refused(store):
+    path, _wet = store
+    flat = _analytic_stats(path)
+    flat["std_votemper"] = np.zeros(N_LEVELS)
+    write_stats(path, flat, force=True)
+
+    try:
+        # _normalize divides without a guard, so this must not reach training.
+        with pytest.raises(AssertionError, match="standard deviation of 0"):
+            _reader(store, source=["votemper_1m"], target=["votemper_1m"])
+    finally:
+        write_stats(path, _analytic_stats(path), force=True)
 
 
 def test_registry_exposes_the_reader():

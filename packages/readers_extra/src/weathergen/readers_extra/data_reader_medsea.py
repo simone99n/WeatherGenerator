@@ -14,9 +14,12 @@ Nine ocean variables, 18 levels down to 971 m, one Zarr store per year from 1987
 to 2021 (must change). The time step is whatever the file says it is,
 daily means in this archive, so 3-hourly or multi-day output reads the same way.
 There is no land-sea mask in the file: land is NaN.
+
+The normalisation statistics are read from the mean and std groups of the store
+itself. A store that has none is not usable: medsea_stats.py computes them and
+medsea_write_stats.py writes them in.
 """
 
-import json
 import logging
 from pathlib import Path
 from typing import override
@@ -181,18 +184,48 @@ class DataReaderMedSea(DataReaderTimestep):
         # Mean and standard deviation per channel, so per variable AND per
         # level: in the Mediterranean the temperature goes from 15-28 C at the
         # surface to about 13.5 C below 500 m, and one mean per variable would
-        # flatten all of that. They are made once by make_medsea_norm_stats.py
-        # and never computed here: the archive is 1.38 TiB.
-        stats_path = Path(stream_info["norm_stats"])
-        assert stats_path.exists(), (
-            f"No normalisation statistics at {stats_path}. "
-            f"Make them once with make_medsea_norm_stats.py."
-        )
-        stats = json.loads(stats_path.read_text())
+        # flatten all of that. They live in the store, in the mean and std
+        # groups, written once by medsea_write_stats.py: statistics travel with
+        # the data they describe instead of in a file beside it.
+        statistics = {}
+        for group in ("mean", "std"):
+            try:
+                statistics[group] = xr.open_zarr(
+                    filename, group=group, consolidated=True, chunks=None, zarr_format=2
+                )
+            except KeyError as error:
+                msg = (
+                    f"{name}: {filename} has no {group} group ({error}). Compute the statistics "
+                    f"with medsea_stats.py and write them into the store with "
+                    f"medsea_write_stats.py."
+                )
+                raise AssertionError(msg) from error
+
         # Both (all channels,): the framework indexes them with source_idx and
-        # target_idx, which point into the full channel list.
-        self.mean = np.array([stats[c]["mean"] for c in CHANNELS], dtype=np.float32)
-        self.stdev = np.array([stats[c]["std"] for c in CHANNELS], dtype=np.float32)
+        # target_idx, which point into the full channel list. np.atleast_1d is
+        # what makes the surface variables work: their statistic is a 0-d array,
+        # and indexing [0] into a 0-d array raises IndexError.
+        self.mean, self.stdev = (
+            np.array(
+                [
+                    np.atleast_1d(statistics[group][CHANNEL_VAR[c]].values)[CHANNEL_LEVEL[c]]
+                    for c in range(len(CHANNELS))
+                ],
+                dtype=np.float32,
+            )
+            for group in ("mean", "std")
+        )
+
+        # _normalize in data_reader_base divides by the deviation with no guard,
+        # so a channel that does not vary would silently produce inf. Only the
+        # channels this stream actually asked for have to be usable.
+        selected = sorted({*self.source_idx, *self.target_idx, *self.geoinfo_idx})
+        flat = [CHANNELS[c] for c in selected if not self.stdev[c] > 0.0]
+        assert not flat, (
+            f"{name}: channel(s) {flat} have a standard deviation of 0 or NaN in {filename}, "
+            f"so they cannot be normalised. Drop them from the stream config, or check the "
+            f"warnings that medsea_stats.py printed for them."
+        )
 
         # Both (geoinfos,), already the subset the config asked for:
         # normalize_geoinfos indexes these by position, while mean and stdev
