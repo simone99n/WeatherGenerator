@@ -1,0 +1,81 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# C-GLORS v8: global daily ocean reanalysis on the ORCA0.25 native grid, 1050 x 1440 =
+# 1,512,000 points per timestep, 1993-01-01 to 2023-12-31. The bare filename is resolved
+# against cf.data_paths, which the private jupiter configuration supplies.
+
+C-GLORS :
+  type : grep
+  # distinct from ERA5's stream_id 0: the id is written into the target coordinate vector,
+  # so two streams sharing it would be indistinguishable to the decoders
+  stream_id : 1
+  filenames : ['nemo_cglorsv8_subset_1993_2023.zarr']
+
+  # Surface only. These are substring filters, not names, and each of the four matches exactly
+  # one of the store's 256 time-varying variables: 'tos' does not occur in thetao_* or botpres,
+  # 'sos' does not occur in so_*, and 'mldr10_1' does not collide with mldkz5. Beware when
+  # extending - 'so', 'uo' or 'vo' would each pull in 32 depth levels plus a stress component.
+  # The channel order the model sees follows the store (alphabetical), not this list.
+  source : ['tos', 'sos', 'zos', 'mldr10_1']
+  target : ['tos', 'sos', 'zos', 'mldr10_1']
+
+  # The ORCA land mask is the coordinate sentinel (-1, -1), which the reader's (0, 0) check does
+  # not catch, so all 288,240 masked points would keep valid coordinates and land in a single
+  # healpix cell - 36k tokens in one cell, well past ae_local_max_tokens_per_cell. Dropping the
+  # rows whose every channel is NaN removes them, and 19.4% of the grid with them.
+  drop_all_nan_rows : True
+
+  loss_weight : 1.
+  # ORCA0.25 is quasi-isotropic, so point density per unit area rises steeply poleward: 35% of
+  # the valid ocean points lie poleward of 60 degrees against 13% of the global area. Without
+  # this the loss is dominated by the Arctic and the Southern Ocean.
+  location_weight : cosine_latitude
+
+  # decoded from the slow tower; input membership is set in latent.groups.*.streams
+  latent_group : ocean
+
+  # 1.22 M valid points over 12288 healpix-level-5 cells is 107 per cell on average and 1540 in
+  # the densest. At token_size 8 that densest cell would hold 193 tokens and trip the 64-token
+  # ceiling asserted in the local assimilation; 32 caps it at 49 and leaves headroom for the
+  # seasonal sea-ice mask.
+  token_size : 32
+
+  # exactly one daily record falls inside each analysis window, so grouping by timestamp would
+  # be a no-op over a single unique datetime
+  tokenize_spacetime : False
+
+  # 20000 / 12288 cells is 1.63 target points per cell, the same decoder load as ERA5's
+  # 20000 / 40320; unbounded would mean 1.5 M decoder queries per output step. The subset is
+  # already random - ReaderData.shuffle draws without replacement and only re-sorts the rows -
+  # so shuffle_target would add nothing.
+  max_num_targets : 20000
+
+  # 'frequency' is deliberately unset. The GREP reader would override the data-derived period
+  # with its own parser, which accepts only forms like 24h or 1D and never 24:00:00, and the
+  # derived period is already exactly one day. (ERA5's frequency: 06:00:00 in this same
+  # directory works because the anemoi reader uses a different parser.)
+
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 256
+  target_readout :
+    # must stay equal to ERA5's: the target prediction engine reads num_heads from the first
+    # stream and applies it to every stream
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1
