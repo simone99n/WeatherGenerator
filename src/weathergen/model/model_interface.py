@@ -63,9 +63,13 @@ def init_model_and_shard(
     # freeze request model part
     apply_fct_to_blocks(model, cf.freeze_modules, freeze_weights)
 
+    # the single encoder, or one tower per latent group
+    encoders = list(model.encoders.values()) if model.encoders is not None else [model.encoder]
+
     # TODO: this should be handled in the encoder to be close where q_cells is defined
     if "q_cells" in cf.freeze_modules:
-        model.encoder.q_cells.requires_grad = False
+        for encoder in encoders:
+            encoder.q_cells.requires_grad = False
 
     if with_ddp and not with_fsdp:
         # create DDP model if running without FSDP
@@ -98,24 +102,35 @@ def init_model_and_shard(
             MultiSelfAttentionHeadVarlen,
         )
 
-        for module in model.encoder.ae_local_engine.ae_local_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+        for encoder in encoders:
+            for module in encoder.ae_local_engine.ae_local_blocks.modules():
+                if isinstance(module, modules_to_shard):
+                    fully_shard(module, **fsdp_kwargs)
 
-        for module in model.encoder.ae_local_global_engine.ae_adapter.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+            for module in encoder.ae_local_global_engine.ae_adapter.modules():
+                if isinstance(module, modules_to_shard):
+                    fully_shard(module, **fsdp_kwargs)
 
-        for module in model.encoder.ae_global_engine.ae_global_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+            for module in encoder.ae_global_engine.ae_global_blocks.modules():
+                if isinstance(module, modules_to_shard):
+                    fully_shard(module, **fsdp_kwargs)
 
-        for module in model.forecast_engine.fe_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                # reshard_after_forward=False keeps FE parameters unsharded
-                # during the multi-step rollout loop.
-                # Needed for pushforward trick.
-                fully_shard(module, reshard_after_forward=False, **fsdp_kwargs)
+        # the single-latent engine, plus every tower's engine and both coupling engines
+        rollout_engines = [model.forecast_engine]
+        if model.forecast_engines is not None:
+            rollout_engines += list(model.forecast_engines.values())
+        rollout_engines += [
+            coupler
+            for coupler in (model.assimilation_coupler, model.rollout_coupler)
+            if coupler is not None
+        ]
+        for engine in rollout_engines:
+            for module in engine.fe_blocks.modules():
+                if isinstance(module, modules_to_shard):
+                    # reshard_after_forward=False keeps FE parameters unsharded
+                    # during the multi-step rollout loop.
+                    # Needed for pushforward trick.
+                    fully_shard(module, reshard_after_forward=False, **fsdp_kwargs)
 
         for module in model.latent_heads.modules():
             if isinstance(module, modules_to_shard):
@@ -146,8 +161,9 @@ def init_model_and_shard(
         # functions in the embedding engine as forward functions. Thus, yielding a crash
         # because the input tensors are not converted to DTensors. This seems to primarily
         # occur during validation.
-        for embed in model.encoder.embed_engine.embeds.values():
-            torch.distributed.fsdp.register_fsdp_forward_method(embed, "forward")
+        for encoder in encoders:
+            for embed in encoder.embed_engine.embeds.values():
+                torch.distributed.fsdp.register_fsdp_forward_method(embed, "forward")
 
     # complete initalization and load model if inference/continuing a run
     if run_id_contd is not None:
@@ -174,6 +190,54 @@ def init_model_and_shard(
     return model, model_params
 
 
+def _remap_latent_group_checkpoint(model, params):
+    """Map a single-latent checkpoint onto a model built from per-group encoder towers.
+
+    The checkpoint's one encoder and one forecasting engine become the default group's. Every
+    other tower has no counterpart and is left to the missing-key path in load_model, which
+    initialises new modules from scratch and logs each one.
+
+    Args:
+        model : the model being loaded into, possibly wrapped by DDP
+        params : the checkpoint state dict
+    Returns:
+        The state dict, with the encoder and engine keys remapped where applicable.
+    """
+
+    unwrapped = model.module if hasattr(model, "module") else model
+    if unwrapped.encoders is None:
+        return params
+
+    # "encoders." / "forecast_engines." never match, so this only finds single-latent checkpoints
+    renames = {"encoder.": "encoders.{}.", "forecast_engine.": "forecast_engines.{}."}
+    if not any(old in key for key in params for old in renames):
+        return params
+
+    default_group = unwrapped.cf.latent.get("default_group")
+    if default_group is None or default_group not in unwrapped.encoders:
+        logger.warning(
+            "Checkpoint has a single encoder but 'latent.default_group' does not name a "
+            "defined group; its weights will be reported as unused."
+        )
+        return params
+
+    def _rename(key):
+        for old, new in renames.items():
+            if old in key:
+                return key.replace(old, new.format(default_group), 1)
+        return key
+
+    remapped = {_rename(key): value for key, value in params.items()}
+
+    if is_root():
+        logger.info(
+            "Mapped the checkpoint's single encoder and forecasting engine onto latent group "
+            f"'{default_group}'; the remaining towers are initialised from scratch."
+        )
+
+    return remapped
+
+
 def load_model(cf, model, device, run_id: str, mini_epoch=-1):
     """Loads model state from checkpoint and checks for missing and unused keys.
     Args:
@@ -190,6 +254,9 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
     params = torch.load(
         path_run / filename, map_location=torch.device("cpu"), mmap=True, weights_only=True
     )
+
+    # warm-starting a latent-group model from a single-latent checkpoint
+    params = _remap_latent_group_checkpoint(model, params)
 
     is_model_sharded = cf.with_ddp and cf.with_fsdp
     if is_model_sharded:

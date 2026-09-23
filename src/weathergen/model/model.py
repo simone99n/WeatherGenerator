@@ -21,12 +21,21 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from weathergen.common.config import Config
+from weathergen.common.config import (
+    Config,
+    get_latent_coupling_stride,
+    get_latent_group_dims,
+    get_latent_group_streams,
+    get_latent_group_strides,
+    get_latent_groups,
+    get_stream_latent_group,
+)
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
     BilinearDecoder,
+    CouplingEngine,
     EnsPredictionHead,
     ForecastingEngine,
     IdentityEngine,
@@ -330,6 +339,22 @@ class Model(torch.nn.Module):
         self.streams: dict[str, typing.Any] = cf.streams
         self.target_token_engines = None
 
+        # Latent groups: per-component encoder towers, each with its own latent tensor and its
+        # own dynamical time step. None keeps the single encoder and self.forecast_engine.
+        self.latent_groups = get_latent_groups(cf)
+        self.latent_group_streams = get_latent_group_streams(cf)
+        self.latent_group_dims = get_latent_group_dims(cf)
+        forecast_cfg = cf.training_config.get("forecast", {})
+        self.latent_group_strides = get_latent_group_strides(cf, forecast_cfg)
+        self.coupling_stride = get_latent_coupling_stride(cf, forecast_cfg)
+        self.stream_latent_groups = {
+            name: get_stream_latent_group(cf, si) for name, si in self.streams.items()
+        }
+        self.encoders = None
+        self.forecast_engines = None
+        self.assimilation_coupler = None
+        self.rollout_coupler = None
+
         assert cf.get("forecast", {}).get("att_dense_rate", 1.0) == 1.0, (
             "Local attention not adapted for register tokens"
         )
@@ -369,19 +394,102 @@ class Model(torch.nn.Module):
         else:
             assert False, f"Unknown latent prediction head type {loss_cfg['head']}"
 
+    def _group_config(self, cf: Config, group) -> Config:
+        """Config for one latent group's tower, with its encoder and fe_* keys overridden.
+
+        Args:
+            cf : Configuration
+            group : the latent.groups entry for this group
+        Returns:
+            A shallow copy of cf describing this group's encoder and forecasting engine.
+        """
+        group_cf = cf.copy()
+
+        for key, value in (group.get("encoder") or {}).items():
+            group_cf[key] = value
+
+        forecast = group.get("forecast")
+        if forecast is not None:
+            group_cf.fe_num_blocks = forecast.get("num_blocks", cf.fe_num_blocks)
+            group_cf.fe_num_heads = forecast.get("num_heads", cf.fe_num_heads)
+            group_cf.fe_dropout_rate = forecast.get("dropout_rate", cf.fe_dropout_rate)
+            group_cf.fe_with_qk_lnorm = forecast.get("with_qk_lnorm", cf.fe_with_qk_lnorm)
+
+        return group_cf
+
+    def _create_latent_groups(self, cf: Config, mode_cfg) -> None:
+        """Create one encoder tower and forecasting engine per latent group, plus the couplers."""
+
+        dims = set(self.latent_group_dims.values())
+        if len(dims) > 1:
+            raise NotImplementedError(
+                f"Latent groups of differing width {sorted(dims)} would need per-group decoder "
+                "and forecasting-engine widths, which is phase 3 of "
+                "docs/multi_time_latents_proposal.md. Give every group the same dim_embed."
+            )
+
+        self.encoders = nn.ModuleDict()
+        self.forecast_engines = nn.ModuleDict()
+
+        for group_name, group in self.latent_groups.items():
+            group_cf = self._group_config(cf, group)
+            self.encoders[group_name] = EncoderModule(
+                group_cf,
+                self.sources_size,
+                self.targets_num_channels,
+                self.targets_coords_size,
+                stream_names=self.latent_group_streams[group_name],
+            )
+            # only groups that are actually advanced get an engine, so that no parameter is
+            # left without a gradient, which FSDP2 does not tolerate
+            if group.get("forecast") is not None and group_name in self.latent_group_strides:
+                self.forecast_engines[group_name] = ForecastingEngine(
+                    group_cf, mode_cfg, self.num_healpix_cells
+                )
+
+        coupling_cfg = cf.latent.get("coupling")
+        if coupling_cfg is not None:
+
+            def coupler_cfg(key):
+                """The sub-block for one coupler, carrying the shared coupling width."""
+                sub = coupling_cfg.get(key)
+                if sub is None:
+                    return None
+                sub = sub.copy()
+                if coupling_cfg.get("dim_embed") is not None:
+                    sub.dim_embed = coupling_cfg.dim_embed
+                return sub
+
+            assimilation_cfg = coupler_cfg("assimilation")
+            if assimilation_cfg is not None:
+                self.assimilation_coupler = CouplingEngine(
+                    cf, assimilation_cfg, self.latent_group_dims
+                )
+
+            rollout_cfg = coupler_cfg("rollout")
+            if rollout_cfg is not None and self.coupling_stride is not None:
+                self.rollout_coupler = CouplingEngine(cf, rollout_cfg, self.latent_group_dims)
+
+        # the single-latent attributes stay unset; an identity keeps code that reaches for the
+        # one forecasting engine harmless
+        self.forecast_engine = IdentityEngine()
+
     def create(self) -> "Model":
         """Create each individual module of the model"""
         cf = self.cf
 
-        self.encoder = EncoderModule(
-            cf, self.sources_size, self.targets_num_channels, self.targets_coords_size
-        )
-
         mode_cfg = cf.training_config
-        if cf.fe_num_blocks > 0:
-            self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+
+        if self.latent_groups is not None:
+            self._create_latent_groups(cf, mode_cfg)
         else:
-            self.forecast_engine = IdentityEngine()
+            self.encoder = EncoderModule(
+                cf, self.sources_size, self.targets_num_channels, self.targets_coords_size
+            )
+            if cf.fe_num_blocks > 0:
+                self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+            else:
+                self.forecast_engine = IdentityEngine()
 
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -589,8 +697,59 @@ class Model(torch.nn.Module):
 
         self.apply(_reset_params)
 
+    def _print_num_parameters_groups(self) -> None:
+        """Per-tower parameter report, used when latent groups are configured."""
+
+        print("-----------------")
+        print(f"Total number of trainable parameters: {get_num_parameters(self):,}")
+        for group_name, encoder in self.encoders.items():
+            print(f"  Latent group '{group_name}':")
+            for stream_name in encoder.stream_names:
+                num_params = get_num_parameters(encoder.embed_engine.embeds[stream_name])
+                print(f"    embedding {stream_name} : {num_params:,}")
+            print(
+                "    local assimilation: "
+                f"{get_num_parameters(encoder.ae_local_engine.ae_local_blocks):,}"
+            )
+            print(
+                f"    local-global adapter: {get_num_parameters(encoder.ae_local_global_engine):,}"
+            )
+            print(
+                "    query aggregation: "
+                f"{get_num_parameters(encoder.ae_aggregation_engine.ae_aggregation_blocks):,}"
+            )
+            print(
+                "    global assimilation: "
+                f"{get_num_parameters(encoder.ae_global_engine.ae_global_blocks):,}"
+            )
+            if group_name in self.forecast_engines:
+                num_params = get_num_parameters(self.forecast_engines[group_name].fe_blocks)
+                print(f"    forecasting engine: {num_params:,}")
+            else:
+                print("    forecasting engine: none, this group is never advanced")
+
+        for label, coupler in (
+            ("assimilation", self.assimilation_coupler),
+            ("rollout", self.rollout_coupler),
+        ):
+            num_params = get_num_parameters(coupler.fe_blocks) if coupler is not None else 0
+            print(f"  Coupling engine, {label}: {num_params:,}")
+
+        print(" coordinate embedding, prediction networks and prediction heads:")
+        for stream_name in self.streams.keys():
+            nps = [
+                get_num_parameters(mdict[stream_name]) if mdict and stream_name in mdict else 0
+                for mdict in (self.embed_target_coords, self.target_token_engines, self.pred_heads)
+            ]
+            print(f"   {stream_name} : {nps[0]:,} / {nps[1]:,} / {nps[2]:,}")
+        print("-----------------")
+
     def print_num_parameters(self) -> None:
         """Print number of parameters for entire model and each module used to build the model"""
+
+        if self.latent_groups is not None:
+            self._print_num_parameters_groups()
+            return
 
         num_params_embed = [
             get_num_parameters(self.encoder.embed_engine.embeds[name])
@@ -682,13 +841,8 @@ class Model(torch.nn.Module):
 
         output = ModelOutput(batch.get_output_len())
 
-        tokens, posteriors = self.encoder(model_params, batch)
+        tokens, posteriors = self.encode(model_params, batch)
         output.add_latent_prediction(0, "posteriors", posteriors)
-
-        # recover batch dimension and separate input_steps
-        shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
-        # collapse along input step dimension
-        tokens = tokens.reshape(shape).sum(axis=1)
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
@@ -697,16 +851,89 @@ class Model(torch.nn.Module):
             without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
             if without_grad:
                 # Pushforward mode: advance tokens without grad; no decoding with torch.no_grad():
-                tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+                tokens = self.advance_latent(tokens, step, model_params.rope_coords)
                 continue
 
-            tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+            tokens = self.advance_latent(tokens, step, model_params.rope_coords)
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch, output)
 
         return output
+
+    def encode(self, model_params: ModelParams, batch: ModelBatch):
+        """Run the encoder, or one tower per latent group, and couple them at analysis time.
+
+        Args:
+            model_params : Query and embedding parameters
+            batch
+        Returns:
+            (latent, posteriors). The latent is a tensor for a single latent space, and a
+            mapping from group name to tensor when latent groups are configured.
+        """
+
+        def collapse_input_steps(tokens: torch.Tensor) -> torch.Tensor:
+            # recover batch dimension, separate input steps, then sum over them
+            shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
+            return tokens.reshape(shape).sum(axis=1)
+
+        if self.latent_groups is None:
+            tokens, posteriors = self.encoder(model_params, batch)
+            return collapse_input_steps(tokens), posteriors
+
+        latents = {}
+        posteriors = []
+        for group_name, encoder in self.encoders.items():
+            tokens, group_posteriors = encoder(model_params, batch)
+            latents[group_name] = collapse_input_steps(tokens)
+            posteriors += (
+                list(group_posteriors) if isinstance(group_posteriors, list) else [group_posteriors]
+            )
+
+        # the towers ingest disjoint sets of parameters and, in general, different streams, so
+        # this is where cross-domain information first reaches each of them
+        if self.assimilation_coupler is not None:
+            latents = self.assimilation_coupler(latents)
+
+        return latents, posteriors
+
+    def advance_latent(self, latents, step: int, coords: torch.Tensor | None = None):
+        """Advance the latent state by one output step.
+
+        With a single latent space this is the forecasting engine. With latent groups, each
+        group is advanced by its own engine only on the steps where its stride fires, so a slow
+        group is held constant in between; the rollout coupler then mixes the groups at its own
+        cadence and is the only place they exchange information during rollout.
+
+        Args:
+            latents : the latent state, a tensor or a mapping from group name to tensor
+            step : Index of the output step, as given by batch.get_output_idxs()
+            coords : Coordinates for 2D RoPE, or None
+        Returns:
+            The advanced latent state, in the same form as the input.
+        """
+        if self.latent_groups is None:
+            return self.forecast_engine(latents, step, coords)
+
+        advanced = {}
+        for group_name, tokens in latents.items():
+            stride = self.latent_group_strides.get(group_name)
+            if stride is not None and step % stride == 0:
+                # rope_2D is rejected for latent groups, so no coordinates are threaded here
+                tokens = self.forecast_engines[group_name](tokens, step, None)
+            advanced[group_name] = tokens
+
+        if self.rollout_coupler is not None and step % self.coupling_stride == 0:
+            advanced = self.rollout_coupler(advanced)
+
+        return advanced
+
+    def concat_latent_groups(self, latents) -> torch.Tensor:
+        """Concatenate the groups' latents along the token axis, in configuration order."""
+        if self.latent_groups is None:
+            return latents
+        return torch.cat([latents[name] for name in self.latent_groups if name in latents], dim=1)
 
     def predict_latent(
         self,
@@ -719,6 +946,9 @@ class Model(torch.nn.Module):
         """
         Compute latent predictions
         """
+
+        # latent losses are not per group yet, so the towers are viewed as one token axis
+        tokens = self.concat_latent_groups(tokens)
 
         # safe latent prediction
         tokens_post_norm = self.latent_pre_norm(tokens) if step == 0 else None
@@ -759,19 +989,38 @@ class Model(torch.nn.Module):
         if not self.pred_heads:
             return output
 
-        # remove register  and class tokens
-        tokens = tokens[:, self.num_aux_tokens :]
-
-        # get 1-ring neighborhood for prediction
         batch_size = len(batch)
-        s = [batch_size, self.num_healpix_cells, self.cf.ae_local_num_queries, tokens.shape[-1]]
         idxs = model_params.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
-        tokens_nbors = tokens.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1)
-        # TODO: precompute in model_params?
-        tokens_nbors_lens = torch.full(
-            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens_nbors.device
-        )
-        tokens_nbors_lens[0] = 0
+
+        # Latents to decode from, per latent group. Streams decoding from the same group share
+        # the gather; without groups there is a single entry keyed by None.
+        latents_per_group: dict[str | None, tuple] = {}
+
+        def latents_for_group(group_name: str | None) -> tuple:
+            if group_name not in latents_per_group:
+                group_tokens = tokens if group_name is None else tokens[group_name]
+                # remove register and class tokens
+                group_tokens = group_tokens[:, self.num_aux_tokens :]
+
+                s = [
+                    batch_size,
+                    self.num_healpix_cells,
+                    self.cf.ae_local_num_queries,
+                    group_tokens.shape[-1],
+                ]
+                nbors = group_tokens.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1)
+                # TODO: precompute in model_params?
+                # the 1-ring gather yields 9 cells per cell, each contributing s[2] queries
+                nbors_lens = torch.full(
+                    (s[0] * s[1] + 1,),
+                    fill_value=9 * s[2],
+                    dtype=torch.int32,
+                    device=nbors.device,
+                )
+                nbors_lens[0] = 0
+                latents_per_group[group_name] = (group_tokens, nbors, nbors_lens, s)
+
+            return latents_per_group[group_name]
 
         # pair with tokens from assimilation engine to obtain target tokens
         for stream_name in self.streams.keys():
@@ -814,10 +1063,15 @@ class Model(torch.nn.Module):
                 )
                 tcs_lens = torch.cat([torch.zeros(1, dtype=torch.int32, device=tcls.device), tcls])
 
+                # decode from the tower this stream is routed to
+                group_tokens, tokens_nbors, tokens_nbors_lens, s = latents_for_group(
+                    self.stream_latent_groups.get(stream_name)
+                )
+
                 if self.cf.decoder_type == "Linear":
                     pred = self.target_token_engines[stream_name](
                         tc_tokens,
-                        tokens.reshape(-1, s[-1]),  # collapse the batch and token dimensions
+                        group_tokens.reshape(-1, s[-1]),  # collapse batch and token dimensions
                         tcs_lens,
                     ).unsqueeze(0)  # add ensemble dim: shape is then [1, preds_per_coord, channels]
                 else:
