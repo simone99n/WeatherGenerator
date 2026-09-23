@@ -837,3 +837,235 @@ def validate_forecast_policy_and_steps(forecast_cfg: OmegaConf, mode: str):
             raise TypeError(valid_forecast_steps_offset1)
     else:
         raise TypeError(valid_forecast_offset)
+
+
+def _as_timedelta(val) -> np.timedelta64:
+    """
+    Parse a configured time step that may not have gone through the timedelta resolver.
+
+    Values in the `latent` block are read straight from YAML, where PyYAML parses the
+    sexagesimal literal `24:00:00` as the integer 86400 - which parse_timedelta reads as
+    seconds, giving the intended 24 hours. A resumed run config stores the same value as a
+    string, and a resolved one as a timedelta64.
+    """
+    if isinstance(val, np.timedelta64):
+        return val.astype("timedelta64[ms]")
+    return parse_timedelta(val)
+
+
+def get_latent_groups(config: Config) -> Config | None:
+    """
+    Return the latent group definitions, or None when the model uses a single latent space.
+    """
+    latent = config.get("latent")
+    if latent is None:
+        return None
+    groups = latent.get("groups")
+    return groups if groups else None
+
+
+def get_latent_group_streams(config: Config) -> dict[str, list[str]]:
+    """
+    Map each latent group to the streams its encoder tower ingests.
+
+    This is input membership and may overlap between groups: an observation that constrains
+    more than one component feeds every tower that needs it. Where a stream is *decoded* from
+    is a separate relation, see get_stream_latent_group.
+    """
+    groups = get_latent_groups(config)
+    if groups is None:
+        return {}
+    return {name: list(group.get("streams") or []) for name, group in groups.items()}
+
+
+def get_latent_group_dims(config: Config) -> dict[str, int]:
+    """
+    Embedding width of each latent group, defaulting to the global ae_global_dim_embed.
+    """
+    groups = get_latent_groups(config)
+    if groups is None:
+        return {}
+    default_dim = config.get("ae_global_dim_embed")
+    return {name: group.get("dim_embed", default_dim) for name, group in groups.items()}
+
+
+def get_latent_group_strides(config: Config, forecast_cfg: Config) -> dict[str, int]:
+    """
+    Number of base forecast steps between two applications of each group's engine.
+
+    A group without a `forecast` block is never advanced and is omitted from the result.
+    """
+    groups = get_latent_groups(config)
+    if groups is None or not forecast_cfg:
+        return {}
+
+    base_step = _as_timedelta(forecast_cfg["time_step"])
+    strides = {}
+    for name, group in groups.items():
+        if group.get("forecast") is None:
+            continue
+        strides[name] = int(_as_timedelta(group.forecast["time_step"]) // base_step)
+    return strides
+
+
+def get_latent_coupling_stride(config: Config, forecast_cfg: Config) -> int | None:
+    """
+    Number of base forecast steps between two applications of the rollout coupling engine.
+
+    Returns None when no rollout coupling is configured, i.e. the towers never mix once the
+    rollout has started.
+    """
+    if get_latent_groups(config) is None or not forecast_cfg:
+        return None
+    coupling = config.latent.get("coupling")
+    if coupling is None:
+        return None
+    rollout = coupling.get("rollout")
+    if rollout is None:
+        return None
+    return int(_as_timedelta(rollout["time_step"]) // _as_timedelta(forecast_cfg["time_step"]))
+
+
+def get_stream_latent_group(config: Config, stream_config: Config) -> str | None:
+    """
+    Name of the latent group a stream is decoded from, or None for a single latent space.
+
+    Exactly one group, unlike input membership. A diagnostic stream may be decoded from a
+    tower without being one of its inputs.
+    """
+    if get_latent_groups(config) is None:
+        return None
+    return stream_config.get("latent_group") or config.latent.get("default_group")
+
+
+def validate_latent_groups(config: Config, mode_cfg: Config, mode: str) -> None:
+    """
+    Validate latent group definitions against one stage configuration.
+
+    Latent groups are per-component encoder towers: each has its own encoder, its own latent
+    tensor and its own dynamical time step. This checks that every tower has inputs, that the
+    two stream relations resolve, that towers of differing width have a space to be mixed in,
+    and that each group's time step is a whole multiple of the stage's base forecast step and
+    fires at least once in the shortest rollout of that stage.
+
+    Args:
+        config : the full configuration
+        mode_cfg : the training/validation/test configuration for this stage
+        mode : the stage name, i.e. training_config, validation_config or test_config
+
+    Raises:
+        ValueError: if the towers, the stream routing or the cadences are inconsistent.
+    """
+
+    groups = get_latent_groups(config)
+    streams = config.get("streams") or {}
+
+    if groups is None:
+        for stream_name, stream_config in streams.items():
+            if stream_config.get("latent_group") is not None:
+                raise ValueError(
+                    f"Stream '{stream_name}' sets 'latent_group' but 'latent.groups' is not "
+                    "configured."
+                )
+        return
+
+    # 2D RoPE coordinates are built for a single group's token axis. The coupling engines attend
+    # over the concatenated axis, for which none are defined, and advance_latent threads no
+    # coordinates into the per-group engines either.
+    if config.get("rope_2D", False):
+        raise ValueError(
+            "'rope_2D' is not supported with latent groups: the coupling engines attend over the "
+            "concatenated token axis, for which no coordinates are defined."
+        )
+
+    # every tower needs inputs, and they have to be streams that exist
+    for group_name, group_streams in get_latent_group_streams(config).items():
+        if not group_streams:
+            raise ValueError(
+                f"Latent group '{group_name}' has no input streams; its encoder would emit "
+                "only learnable queries. Set 'latent.groups.{group_name}.streams'."
+            )
+        for stream_name in group_streams:
+            if stream_name not in streams:
+                raise ValueError(
+                    f"Latent group '{group_name}' lists input stream '{stream_name}', which is "
+                    "not a defined stream."
+                )
+
+    # every stream must be decoded from a group that exists
+    default_group = config.latent.get("default_group")
+    if default_group is not None and default_group not in groups:
+        raise ValueError(
+            f"'latent.default_group' is '{default_group}', which is not a defined group."
+        )
+    for stream_name, stream_config in streams.items():
+        group_name = get_stream_latent_group(config, stream_config)
+        if group_name is None:
+            raise ValueError(
+                f"Stream '{stream_name}' sets no 'latent_group' and 'latent.default_group' "
+                "is not set."
+            )
+        if group_name not in groups:
+            raise ValueError(
+                f"Stream '{stream_name}' references unknown latent group '{group_name}'."
+            )
+        # a shared spatial prediction head is dimensioned for one tower only
+        shared = stream_config.get("pred_spatial_shared")
+        if shared is not None and shared in streams:
+            shared_group = get_stream_latent_group(config, streams[shared])
+            if shared_group != group_name:
+                raise ValueError(
+                    f"Stream '{stream_name}' shares its prediction head with '{shared}' but "
+                    f"they decode from different latent groups ('{group_name}' vs "
+                    f"'{shared_group}')."
+                )
+
+    # towers of differing width can only be mixed through a shared projection
+    coupling = config.latent.get("coupling")
+    group_dims = set(get_latent_group_dims(config).values())
+    if len(group_dims) > 1 and (coupling is None or coupling.get("dim_embed") is None):
+        raise ValueError(
+            f"Latent groups have differing widths {sorted(group_dims)}, so "
+            "'latent.coupling.dim_embed' must be set to give the coupling engines a shared "
+            "space to mix them in."
+        )
+
+    # cadences are only meaningful for a stage that actually rolls out
+    forecast_cfg = mode_cfg.get("forecast")
+    if not forecast_cfg or forecast_cfg.get("policy") is None:
+        return
+
+    base_step = _as_timedelta(forecast_cfg["time_step"])
+    if base_step <= np.timedelta64(0, "ms"):
+        raise ValueError(
+            f"'{mode}.forecast.time_step' must be positive when latent groups are used."
+        )
+
+    offset = int(forecast_cfg.get("offset", 0))
+    # num_steps may be a per-mini-epoch curriculum, so the shortest rollout is what counts
+    num_steps = forecast_cfg.get("num_steps", 0)
+    if OmegaConf.is_config(num_steps):
+        num_steps = OmegaConf.to_object(num_steps)
+    shortest_rollout = int(np.array(num_steps, dtype=np.int32).reshape(-1).min())
+    output_idxs = range(offset, offset + shortest_rollout)
+
+    for group_name, group in groups.items():
+        if group.get("forecast") is None:
+            continue
+
+        group_step = _as_timedelta(group.forecast["time_step"])
+        if group_step < base_step or group_step % base_step != np.timedelta64(0, "ms"):
+            raise ValueError(
+                f"Latent group '{group_name}' has time_step {timedelta_to_str(group_step)}, "
+                f"which must be a whole multiple of '{mode}.forecast.time_step' "
+                f"({timedelta_to_str(base_step)})."
+            )
+
+        stride = int(group_step // base_step)
+        if not any(idx % stride == 0 for idx in output_idxs):
+            raise ValueError(
+                f"Latent group '{group_name}' fires every {stride} steps but the shortest "
+                f"rollout of '{mode}' only visits steps {list(output_idxs)}, so its engine "
+                "would never run and would receive no gradient. Increase "
+                f"'{mode}.forecast.num_steps' to at least {stride}."
+            )

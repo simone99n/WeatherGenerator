@@ -142,6 +142,7 @@ class Trainer(TrainerBase):
             strict=True,
         ):
             config.validate_forecast_policy_and_steps(mode_cfg.get("forecast", {}), mode)
+            config.validate_latent_groups(cf, mode_cfg, mode)
 
         self.mixed_precision_dtype = get_dtype(cf.mixed_precision_dtype)
 

@@ -61,6 +61,15 @@ fe_impute_latent_noise_std: 0.0  # 1e-4
 # currently fixed to 1.0 (due to limitations with flex_attention and triton)
 forecast_att_dense_rate: 1.0
 
+# Multi-time latent spaces. With groups: null the model has a single latent space, a single
+# encoder and the fe_* engine above. When set, each group is a per-component encoder tower with
+# its own latent tensor and its own dynamical time step; towers meet only in the coupling
+# engines. See docs/multiple_latents.md and validate_latent_groups in weathergen.common.config.
+latent:
+  groups: null
+  default_group: null
+  coupling: null
+
 num_class_tokens: 0
 num_register_tokens: 0
 
