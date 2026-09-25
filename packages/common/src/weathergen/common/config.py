@@ -99,7 +99,7 @@ def _sanitize_start_end_time_keys(sub_conf):
 
 def _sanitize_delta_time_keys(sub_conf):
     """Convert time delta keys to timedelta resolvers."""
-    delta_keys = ["time_window_step", "time_window_len"]
+    delta_keys = ["time_window_step", "time_window_len", "analysis_window_step"]
     for key in delta_keys:
         if key in sub_conf:
             sub_conf = _patch_time(key, sub_conf, _TIMEDELTA_TYPE_NAME)
@@ -372,7 +372,7 @@ def _check_time_interpolation(config: Config) -> Config:
             cfg[key] = value
 
     time_keys = ["start_date", "end_date"]
-    delta_keys = ["time_window_step", "time_window_len"]
+    delta_keys = ["time_window_step", "time_window_len", "analysis_window_step"]
     forecast_step_dt = "time_step"
 
     config = config.copy()

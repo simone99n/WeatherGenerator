@@ -48,6 +48,45 @@ FORECAST_DEFAULTS = {
     "num_steps": np.array([0], dtype=np.int32),
 }
 
+# analysis times are aligned to this origin rather than to start_date, so that an analysis step of
+# 24:00:00 means 00 UTC whatever the date range of the stage
+_ANALYSIS_ORIGIN = np.datetime64("1970-01-01T00:00", "ms")
+
+
+def get_analysis_window_step(mode_cfg) -> np.timedelta64 | None:
+    """The stage's analysis_window_step, or None when every window may be an analysis window."""
+    analysis_step = mode_cfg.get("analysis_window_step", None)
+    window_step = mode_cfg.time_window_step
+    if analysis_step is not None and (
+        analysis_step <= np.timedelta64(0, "ms")
+        or analysis_step % window_step != np.timedelta64(0, "ms")
+    ):
+        raise ValueError(
+            f"analysis_window_step {analysis_step} must be a positive whole multiple of "
+            f"time_window_step {window_step}."
+        )
+    return analysis_step
+
+
+def analysis_window_mask(
+    idxs: np.typing.NDArray[np.int64],
+    tw_handler: TimeWindowHandler,
+    analysis_step: np.timedelta64 | None,
+) -> np.typing.NDArray[np.bool_]:
+    """
+    Which window indices may serve as the analysis (t = 0) window of a sample.
+
+    All of them when analysis_step is None. Otherwise only the windows that start at a whole
+    multiple of analysis_step since 1970-01-01T00:00, e.g. the 00 UTC windows for 24:00:00. This
+    restricts where a sample may start, not the window grid: the source and target windows of a
+    sample are still located on the time_window_step grid.
+    """
+    if analysis_step is None:
+        return np.ones(idxs.shape, dtype=bool)
+
+    starts = tw_handler.t_start + idxs * tw_handler.t_window_step
+    return (starts - _ANALYSIS_ORIGIN) % analysis_step == np.timedelta64(0, "ms")
+
 
 def collect_datasources(stream_datasets: list, idx: int, type: str, rng) -> IOReaderData:
     """
@@ -123,6 +162,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
         self.len_timedelta = mode_cfg.time_window_len
         self.step_timedelta = mode_cfg.time_window_step
+        self.analysis_step = get_analysis_window_step(mode_cfg)
         tw = TimeWindowHandler(
             self.mode_cfg.start_date,
             self.mode_cfg.end_date,
@@ -165,7 +205,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             // self.step_timedelta  # as number of indexs
         )
 
-        available_samples = max_index * self.batch_size  # as number of samples
+        # only the windows that may be analysis windows can start a sample
+        num_windows = np.count_nonzero(
+            analysis_window_mask(
+                np.arange(self.index_range.start, max_index),
+                self.time_window_handler,
+                self.analysis_step,
+            )
+        )
+        available_samples = num_windows * self.batch_size  # as number of samples
 
         assert available_samples > 0, (
             "There is an insufficient date range to \
@@ -215,7 +263,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 
-        return np.arange(self.max_input_steps, perms_len)
+        perms = np.arange(self.max_input_steps, perms_len)
+        if self.analysis_step is not None:
+            perms = perms[analysis_window_mask(perms, self.time_window_handler, self.analysis_step)]
+            assert perms.size > 0, "No window in the date range can serve as an analysis window."
+
+        return perms
 
     def _init_stream_datasets(self, cf) -> dict[StreamName, _Stream]:
         """Load dataset readers for all streams from config."""

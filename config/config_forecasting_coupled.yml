@@ -190,10 +190,14 @@ training_config:
   # time_window_step must divide forecast.time_step below: the target window is located by
   # integer division, step_forecast_dt = idx + (time_step * i) // time_window_step, so a 24 h
   # window step would collapse the +6/+12/+18 h targets onto the analysis window itself.
-  # C-GLORS is daily, so the ocean tower only has an analysis in the windows that start at
-  # 00 UTC; in the other three it falls through the spoof path and is_spoof zeroes its loss.
   time_window_step: 06:00:00
   time_window_len: 06:00:00
+  # C-GLORS is daily, at 00 UTC, so only the windows starting at 00 UTC hold an ocean record.
+  # Starting every sample in one of those keeps the ocean input real, and the ocean engine then
+  # fires at step 4, on the only real ocean target; the +6/+12/+18 h ocean targets are spoofed
+  # and weighted 0. It also keeps a spoofed ocean input, whose chunk count varies between ranks,
+  # from reaching the FSDP2-sharded adapter. The targets stay on the 6 h grid above.
+  analysis_window_step: 24:00:00
 
   learning_rate_scheduling :
     lr_start: 1e-6
