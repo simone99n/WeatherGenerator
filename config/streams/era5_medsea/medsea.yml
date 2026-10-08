@@ -63,9 +63,9 @@ MedSea :
   # so the two streams contribute a comparable number of target points.
   max_num_targets : 20000
 
-  # Up to about 2700 sea points fall into one HEALPix level-5 cell at 1/24 degree,
-  # and the model accepts at most 64 tokens per cell: 8 points per token (up to 336
-  # tokens) stops training at the first step, 64 points per token gives at most 42.
+  # The fullest HEALPix level-5 cell holds 2536 sea points at 1/24 degree, and the
+  # model accepts at most 64 tokens per cell: 8 points per token (317 tokens) stops
+  # training at the first step, 64 points per token gives 40.
   token_size : 64
 
   # dim_embed matches era5.yml: both streams feed the same latent space.
