@@ -174,16 +174,19 @@ rdata.geoinfos = ds.normalize_geoinfos(rdata.geoinfos)
 
 Three consequences nobody guesses:
 
-**1. NaN in `data` is never filtered.** Only NaN in `coords` or `geoinfos` drops the row. So missing
-values in the data are yours to handle. Writing the channel mean is the right move, because the
-framework then normalises it to exactly 0:
+**1. NaN in `data` stays in the point cloud, and the framework handles it.** Only NaN in `coords` or
+`geoinfos` drops the row. A NaN source value becomes 0 after normalisation, i.e. the channel mean
+(`stream_data.py`), and a NaN target contributes no error to the loss. So a reader may leave
+missing values as NaN, as `data_reader_template.py` does. Filling them with the channel mean, as the
+Mediterranean reader does, gives the same inputs, but turns those points into targets of value 0
+that do count in the loss:
 
 ```python
 missing = ~np.isfinite(data)
 data[missing] = np.broadcast_to(self.mean[channels_idx], data.shape)[missing]
 ```
 
-Writing a plain `0` instead would mean a sea temperature of 0 °C.
+What a reader must never write is a plain `0`: it would mean a sea temperature of 0 °C.
 
 **2. A NaN geoinfo deletes the point.** `remove_nan_coords_and_geoinfos` drops any row whose
 geoinfos are not all finite. A deep channel used as a geoinfo would silently shrink the point
@@ -349,7 +352,8 @@ case "medsea":
 ### Layer 1 — the machine
 
 In the private repository, `hpc/<machine>/config/paths.yml`. Your dataset's directory has to be in
-**`data_paths`**: that is the list the loader resolves stream `filenames` against. The neighbouring
+**`data_paths`**: that is the list the loader resolves stream `filenames` against. An absolute path
+in `filenames` is used as it is and needs no entry, as in the Mediterranean stream config. The neighbouring
 `data_path_*` keys are a legacy fallback for configs with no `data_paths`, and that fallback is a
 hardcoded list of five names — adding `data_path_mydataset` alone does nothing.
 
@@ -428,7 +432,7 @@ Before opening a pull request:
 - [ ] `mean`/`stdev` cover **all** channels; `mean_geoinfo`/`stdev_geoinfo` only the selected ones;
 - [ ] `_get` uses `channels_idx` and never `self.source_idx`;
 - [ ] column order is the config's order;
-- [ ] missing values filled in `data` **and** in `geoinfos`;
+- [ ] missing values in `geoinfos` filled; in `data`, NaN is fine and a plain 0 is not;
 - [ ] `check_reader_data(rd, dtr)` called on every non-empty return;
 - [ ] the period comes from the file;
 - [ ] every reshape carries its shape annotation;
@@ -438,7 +442,7 @@ Before opening a pull request:
 
 | Trap | What happens | Where |
 | --- | --- | --- |
-| NaN left in `data` | reaches the model as NaN; nothing filters it | §4 |
+| a plain 0 for a missing value | a physical value of 0 enters the inputs and the loss | §4 |
 | NaN in `geoinfos` | the whole point disappears from the sample | §4 |
 | `mean_geoinfo` as the full array | geoinfos normalised with another channel's statistics | §3 |
 | window shorter than the period | most samples silently spoofed with mean values | §5 |
