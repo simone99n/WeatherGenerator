@@ -1,0 +1,59 @@
+# (C) Copyright 2026 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# ERA5 plus the Mediterranean Sea reanalysis, atmosphere and ocean in one run.
+#
+# This is an overlay on config/default_config.yml, not a copy of it: only what
+# differs is here, and --config merges it on top. See load_merge_configs in
+# packages/common/src/weathergen/common/config.py for the order of precedence.
+#
+#   uv run --offline train --config config/config_era5_medsea.yml \
+#       --private-config <WeatherGenerator-private>/hpc/jupiter/config/paths.yml
+#
+# The ocean stream needs the mean and std groups inside its store: see
+# medsea_stats.py and medsea_write_stats.py in packages/readers_extra.
+
+streams_directory: "./config/streams/era5_medsea/"
+
+training_config:
+  # Only 2021 of the Mediterranean reanalysis is staged on Jupiter. Its first
+  # and last daily mean are labelled at noon and a window has to fall entirely
+  # inside the store, so the usable windows start on 2 January and the last one
+  # starts on 30 December.
+  start_date: 2021-01-02T00:00
+  end_date: 2021-11-30T00:00
+
+  # One day, because the ocean fields are daily means: in a six-hour window the
+  # noon timestamp falls one time in four, and the other three windows would be
+  # replaced by spoofed samples of mean values, silently. Measured on the store:
+  # 24 hours gives 200 windows with ocean data out of 200, six hours gives 50.
+  #
+  # ERA5 is opened at six-hourly by its own frequency key in era5.yml, so a
+  # 24-hour window gives it four steps, about 161000 source points, against the
+  # 144990 of the ocean: the two streams stay comparable, which is also why
+  # both stream configs cap max_num_targets at 20000.
+  time_window_len: 24:00:00
+  time_window_step: 06:00:00
+
+  forecast:
+    # A day ahead, the natural step of a daily ocean. num_steps, offset and
+    # policy stay as the default config sets them.
+    time_step: 24:00:00
+
+  # A year at a six-hour step is about 1320 windows, so the 4096 samples per
+  # mini epoch of the default would ask for data that does not exist.
+  samples_per_mini_epoch: 1024
+  num_mini_epochs: 8
+
+validation_config:
+  # December of the same year, about 116 windows. Everything else, the window
+  # length and the forecast among it, is inherited from training_config.
+  start_date: 2021-12-01T00:00
+  end_date: 2021-12-30T00:00
+  samples_per_mini_epoch: 96
