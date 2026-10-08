@@ -13,7 +13,7 @@
 # differs is here, and --config merges it on top. See load_merge_configs in
 # packages/common/src/weathergen/common/config.py for the order of precedence.
 #
-#   weathergen train --config config/config_era5_medsea.yml \
+#   uv run --offline train --config config/config_era5_medsea.yml \
 #       --private-config <WeatherGenerator-private>/hpc/jupiter/config/paths.yml
 #
 # The ocean stream needs the mean and std groups inside its store: see

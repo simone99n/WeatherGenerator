@@ -24,7 +24,8 @@ MedSea :
   # standard deviation of temperature goes from 4.55 at the surface to 0.28 at
   # 971 m and a single value per variable would flatten the deep signal.
   # Written with medsea_stats.py + medsea_write_stats.py.
-  filenames : ['reanalysis-2021_v2.zarr']
+  # An absolute path is used as it is, so the private data_paths need no entry for it.
+  filenames : ['/e/scratch/weatherai/norberti1/reanalysis-2021_v2.zarr']
 
   # A channel is a variable, and for the deep ones a variable at one depth.
   # The 18 available depths in metres are:
@@ -62,7 +63,10 @@ MedSea :
   # so the two streams contribute a comparable number of target points.
   max_num_targets : 20000
 
-  token_size : 8
+  # Up to about 2700 sea points fall into one HEALPix level-5 cell at 1/24 degree,
+  # and the model accepts at most 64 tokens per cell: 8 points per token (up to 336
+  # tokens) stops training at the first step, 64 points per token gives at most 42.
+  token_size : 64
 
   # dim_embed matches era5.yml: both streams feed the same latent space.
   embed :
