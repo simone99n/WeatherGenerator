@@ -30,13 +30,22 @@ from weathergen.model.positional_encoding import positional_encoding_harmonic
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
 
-    def __init__(self, cf: Config, sources_size, targets_num_channels, targets_coords_size) -> None:
+    def __init__(
+        self,
+        cf: Config,
+        sources_size,
+        targets_num_channels,
+        targets_coords_size,
+        stream_names=None,
+    ) -> None:
         """
         Initialize the EmbeddingEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
         :param sources_size: List of source sizes for each stream.
-        :param stream_names: Ordered list of stream identifiers aligned with cf.streams.
+        :param stream_names: Streams this tower ingests. Defaults to every stream, which is the
+            single-latent case; a latent group passes its own subset, and the tower then never
+            sees the others.
         """
         super(EncoderModule, self).__init__()
         self.cf = cf
@@ -58,9 +67,14 @@ class EncoderModule(torch.nn.Module):
 
         # embedding engine
         # determine stream names once so downstream components use consistent keys
-        self.stream_names = list(cf.streams.keys())
+        all_stream_names = list(cf.streams.keys())
+        self.stream_names = (
+            list(stream_names) if stream_names is not None else list(all_stream_names)
+        )
+        # positions on the stream axis of batch.tokens_lens that this tower owns
+        self.stream_idxs = [all_stream_names.index(name) for name in self.stream_names]
         # separate embedding networks for differnt observation types
-        self.embed_engine = EmbeddingEngine(cf, self.sources_size)
+        self.embed_engine = EmbeddingEngine(cf, self.sources_size, self.stream_names)
 
         assert cf.ae_global_att_dense_rate == 1.0, "Local attention not adapted for register tokens"
         self.num_register_tokens = cf.num_register_tokens
@@ -122,12 +136,21 @@ class EncoderModule(torch.nn.Module):
         Encoder forward
         """
 
+        # restrict the stream axis to the streams this tower ingests; every downstream length,
+        # scatter index and cell count is derived from this view rather than from the batch
+        tokens_lens = batch.tokens_lens[:, :, self.stream_idxs, :]
+
         stream_cell_tokens = checkpoint(
-            self.embed_engine, batch, model_params.pe_embed, use_reentrant=False
+            self.embed_engine, batch, model_params.pe_embed, tokens_lens, use_reentrant=False
         )
 
         tokens_global, posteriors = checkpoint(
-            self.assimilate_local, model_params, stream_cell_tokens, batch, use_reentrant=False
+            self.assimilate_local,
+            model_params,
+            stream_cell_tokens,
+            batch,
+            tokens_lens,
+            use_reentrant=False,
         )
 
         tokens_global = checkpoint(
@@ -273,7 +296,11 @@ class EncoderModule(torch.nn.Module):
         return tokens_global_unmasked
 
     def assimilate_local(
-        self, model_params, tokens: torch.Tensor, batch: ModelBatch
+        self,
+        model_params,
+        tokens: torch.Tensor,
+        batch: ModelBatch,
+        tokens_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Processes embedded tokens locally and prepares them for the global assimilation
@@ -287,7 +314,10 @@ class EncoderModule(torch.nn.Module):
             Tokens for global assimilation
         """
 
-        cell_lens = torch.sum(batch.tokens_lens, 2).flatten()
+        if tokens_lens is None:
+            tokens_lens = batch.tokens_lens
+
+        cell_lens = torch.sum(tokens_lens, 2).flatten()
 
         num_steps_input = batch.get_num_source_steps()
         rs = num_steps_input * len(batch)
@@ -314,7 +344,7 @@ class EncoderModule(torch.nn.Module):
         tokens_global_unmasked = self.aggregation_engine_unmasked(
             tokens_global_unmasked,
             tokens_global_register_class,
-            batch.tokens_lens,
+            tokens_lens,
             rope_cell_coords=model_params.rope_cell_coords,
         )
 

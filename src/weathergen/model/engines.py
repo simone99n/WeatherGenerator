@@ -36,22 +36,32 @@ from weathergen.utils.utils import get_dtype
 class EmbeddingEngine(torch.nn.Module):
     name: "EmbeddingEngine"
 
-    def __init__(self, cf: Config, sources_size) -> None:
+    def __init__(self, cf: Config, sources_size, stream_names=None) -> None:
         """
         Initialize the EmbeddingEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
-        :param sources_size: List of source sizes for each stream.
+        :param sources_size: List of source sizes, aligned with cf.streams.
+        :param stream_names: Streams this engine owns, in the order they appear on the stream
+            axis of the tokens_lens passed to forward. Defaults to every stream, which is the
+            single-latent case; a latent group passes its own subset.
         """
         super(EmbeddingEngine, self).__init__()
         self.cf = cf
         self.dtype = get_dtype(self.cf.mixed_precision_dtype)
         self.sources_size = sources_size  # KCT:iss130, what is this?
         self.embeds = torch.nn.ModuleDict()
-        self.streams = cf.streams
 
-        for i, (stream_name, si) in enumerate(self.streams.items()):
-            if si.get("diagnostic", False) or self.sources_size[i] == 0:
+        all_stream_names = list(cf.streams.keys())
+        self.stream_names = (
+            list(stream_names) if stream_names is not None else list(all_stream_names)
+        )
+        # keyed by name rather than position, so a subset indexes correctly
+        sizes = dict(zip(all_stream_names, sources_size, strict=False))
+        self.streams = {name: cf.streams[name] for name in self.stream_names}
+
+        for stream_name, si in self.streams.items():
+            if si.get("diagnostic", False) or sizes[stream_name] == 0:
                 self.embeds[stream_name] = torch.nn.Identity()
                 continue
 
@@ -59,7 +69,7 @@ class EmbeddingEngine(torch.nn.Module):
                 self.embeds[stream_name] = StreamEmbedTransformer(
                     num_tokens=si["embed"]["num_tokens"],
                     token_size=si["token_size"],
-                    num_channels=self.sources_size[i],
+                    num_channels=sizes[stream_name],
                     dim_embed=si["embed"]["dim_embed"],
                     dim_out=self.cf.ae_local_dim_embed,
                     num_blocks=si["embed"]["num_blocks"],
@@ -71,24 +81,29 @@ class EmbeddingEngine(torch.nn.Module):
                 )
             elif si["embed"]["net"] == "linear":
                 self.embeds[stream_name] = StreamEmbedLinear(
-                    self.sources_size[i] * si["token_size"],
+                    sizes[stream_name] * si["token_size"],
                     self.cf.ae_local_dim_embed,
                     stream_name=stream_name,
                 )
             else:
                 raise ValueError("Unsupported embedding network type")
 
-    def forward(self, batch, pe_embed):
+    def forward(self, batch, pe_embed, tokens_lens=None):
         num_steps_input = batch.get_num_source_steps()
 
-        num_tokens = torch.sum(batch.tokens_lens, 2).flatten().sum().item()
+        # tokens_lens is the stream-axis view this engine owns; it is batch.tokens_lens for
+        # the single-latent case and a per-group slice of it otherwise
+        if tokens_lens is None:
+            tokens_lens = batch.tokens_lens
+
+        num_tokens = torch.sum(tokens_lens, 2).flatten().sum().item()
         tokens_all = torch.empty(
             (num_tokens, self.cf.ae_local_dim_embed), dtype=self.dtype, device=batch.get_device()
         )
 
-        # iterate over all streams
+        # iterate over the streams this engine owns, in stream-axis order
         x_embeds = []
-        for stream_name in self.streams.keys():
+        for stream_name in self.stream_names:
             # collect all source tokens from all input_steps and all samples in the batch
             sdata = []
             for istep in range(num_steps_input):
@@ -110,40 +125,40 @@ class EmbeddingEngine(torch.nn.Module):
 
         # if the assert is hit, max_number_tokens_local_per_cell in config needs to be increased
         max_tokens = self.cf.get("ae_local_max_tokens_per_cell", 64)
-        assert batch.tokens_lens.flatten(0, 2).sum(0).max() <= max_tokens, (
+        assert tokens_lens.flatten(0, 2).sum(0).max() <= max_tokens, (
             "max number of tokens per cell for positional encoding exceeded."
         )
         " Increase ae_local_max_tokens_per_cell in config."
 
-        if batch.tokens_lens.shape[2] == 1:
+        if tokens_lens.shape[2] == 1:
             # trivial with one stream
             tokens_all = torch.cat(x_embeds)
 
         else:
-            scatter_idxs = self.get_scatter_idxs_vectorized(batch)
+            scatter_idxs = self.get_scatter_idxs_vectorized(tokens_lens, batch.get_device())
             scatter_idxs = scatter_idxs.unsqueeze(1).repeat((1, self.cf.ae_local_dim_embed))
 
             # actual scatter operation and apply per cell positional encoding
             tokens_all.scatter_(0, scatter_idxs, torch.cat(x_embeds))
 
-        pe_idxs = self.get_pe_idxs_vectorized(batch)
+        pe_idxs = self.get_pe_idxs_vectorized(tokens_lens)
         tokens_all = tokens_all + pe_embed[pe_idxs]
 
         return tokens_all
 
-    def get_pe_idxs_vectorized(self, batch):
+    def get_pe_idxs_vectorized(self, tokens_lens):
         """
         Compute per cell indices into positional encoding
         """
 
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).sum(0).flatten()
+        tok_counts = tokens_lens.permute([2, 0, 1, 3]).sum(0).flatten()
         rows = torch.arange(tok_counts.max(), device=tok_counts.device).unsqueeze(0)
         rows = rows.expand(tok_counts.shape[0], -1)
         pe_idxs = rows[rows < tok_counts.unsqueeze(1)]
 
         return pe_idxs
 
-    def get_scatter_idxs(self, batch):
+    def get_scatter_idxs(self, tokens_lens, dev):
         """
         Compute reordering index so that tokens from different streams but same cell are
         continguous
@@ -151,10 +166,9 @@ class EmbeddingEngine(torch.nn.Module):
         Simple version (reference implementation)
         """
 
-        dev = batch.get_device()
-        # batch.tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
+        # tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
         # flatten leasds to streams x tokens per cell (across all cells for input steps and samples)
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
+        tok_counts = tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
 
         scatter_idxs = []
         for i in range(len(tok_counts)):
@@ -172,7 +186,7 @@ class EmbeddingEngine(torch.nn.Module):
 
         return scatter_idxs
 
-    def get_scatter_idxs_vectorized(self, batch):
+    def get_scatter_idxs_vectorized(self, tokens_lens, dev):
         """
         Compute reordering index so that tokens from different streams but same cell are
         continguous
@@ -180,10 +194,9 @@ class EmbeddingEngine(torch.nn.Module):
         Vectorized version
         """
 
-        dev = batch.get_device()
-        # batch.tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
+        # tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
         # flatten leasds to streams x tokens per cell (across all cells for input steps and samples)
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
+        tok_counts = tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
 
         # partial sums for per cell offsets
         pad = torch.zeros((1, tok_counts.shape[1]), dtype=torch.int64, device=dev)
@@ -634,6 +647,118 @@ class ForecastingEngine(torch.nn.Module):
             else:
                 tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
         return tokens
+
+
+class CouplingEngine(torch.nn.Module):
+    name: "CouplingEngine"
+
+    def __init__(self, cf: Config, coupling_cfg, group_dims: dict) -> None:
+        """
+        Initialize a CouplingEngine.
+
+        With per-group encoder towers, the latent of each group is its own tensor. This engine
+        is the only place they meet: it projects every group into a shared width, attends over
+        the concatenated token axis, and projects back. Two instances are used, with separate
+        weights and different jobs - the assimilation coupler reconciles observations of
+        different domains taken at the same time, the rollout coupler exchanges forecast state
+        between components running at different rates.
+
+        The block list is named fe_blocks so that FSDP sharding and parameter reporting can
+        treat it exactly like a ForecastingEngine.
+
+        :param cf: Configuration object containing parameters for the engine.
+        :param coupling_cfg: the latent.coupling.assimilation or .rollout sub-configuration.
+        :param group_dims: embedding width of each latent group.
+        """
+        super(CouplingEngine, self).__init__()
+        self.cf = cf
+        self.group_names = list(group_dims.keys())
+
+        # 2D RoPE coordinates are built for a single group's token axis; the concatenated axis
+        # this engine attends over has no coordinates yet
+        assert not cf.get("rope_2D", False), (
+            "rope_2D is not supported with latent groups: the coupling engine attends over the "
+            "concatenated token axis, for which no coordinates are defined."
+        )
+
+        dim_coupling = coupling_cfg.get("dim_embed") or cf.ae_global_dim_embed
+        self.dim_coupling = dim_coupling
+
+        # per-group projections into the shared coupling space, identity where the widths
+        # already agree so that a uniform-width model pays nothing for them
+        self.proj_in = torch.nn.ModuleDict()
+        self.proj_out = torch.nn.ModuleDict()
+        for name, dim in group_dims.items():
+            if dim == dim_coupling:
+                self.proj_in[name] = torch.nn.Identity()
+                self.proj_out[name] = torch.nn.Identity()
+            else:
+                self.proj_in[name] = torch.nn.Linear(dim, dim_coupling, bias=False)
+                self.proj_out[name] = torch.nn.Linear(dim_coupling, dim, bias=False)
+
+        self.fe_blocks = torch.nn.ModuleList()
+        num_heads = coupling_cfg.get("num_heads", cf.fe_num_heads)
+        dropout_rate = coupling_cfg.get("dropout_rate", cf.fe_dropout_rate)
+
+        for _ in range(coupling_cfg.get("num_blocks", 1)):
+            self.fe_blocks.append(
+                MultiSelfAttentionHead(
+                    dim_coupling,
+                    num_heads=num_heads,
+                    dropout_rate=dropout_rate,
+                    with_qk_lnorm=cf.fe_with_qk_lnorm,
+                    with_flash=cf.with_flash_attention,
+                    norm_type=cf.norm_type,
+                    qk_norm_type=cf.get("qk_norm_type", cf.norm_type),
+                    norm_eps=cf.norm_eps,
+                    attention_dtype=get_dtype(cf.attention_dtype),
+                    with_2d_rope=False,
+                )
+            )
+            self.fe_blocks.append(
+                MLP(
+                    dim_coupling,
+                    dim_coupling,
+                    with_residual=True,
+                    dropout_rate=dropout_rate,
+                    norm_type=cf.norm_type,
+                    norm_eps=cf.mlp_norm_eps,
+                )
+            )
+
+        # start close to the identity, as the forecasting engine does, so that coupling does
+        # not disrupt a model warm-started from a single-latent checkpoint
+        def init_weights_final(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+                if m.bias is not None:
+                    torch.nn.init.normal_(m.bias, mean=0, std=0.001)
+
+        for block in self.fe_blocks:
+            block.apply(init_weights_final)
+
+    def forward(self, latents: dict) -> dict:
+        """
+        Args:
+            latents : per-group latent tensors, each (batch, num_tokens_g, dim_g)
+        Returns:
+            The same mapping, with every group updated by the cross-group attention.
+        """
+
+        names = [name for name in self.group_names if name in latents]
+        projected = [self.proj_in[name](latents[name]) for name in names]
+        token_counts = [tokens.shape[1] for tokens in projected]
+
+        tokens = torch.cat(projected, dim=1)
+        aux_info = None
+        for block in self.fe_blocks:
+            tokens = checkpoint(block, tokens, None, aux_info, use_reentrant=False)
+
+        split = torch.split(tokens, token_counts, dim=1)
+        return {
+            name: self.proj_out[name](group_tokens)
+            for name, group_tokens in zip(names, split, strict=True)
+        }
 
 
 class EnsPredictionHead(torch.nn.Module):

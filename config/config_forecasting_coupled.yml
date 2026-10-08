@@ -1,0 +1,276 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Coupled ERA5 + C-GLORS forecasting with multi-time latent spaces.
+#
+# Two encoder towers, each fed only by its own streams: a fast atmosphere advanced every 6 h and
+# a slower, narrower ocean advanced every 24 h. The towers share no parameters and no inputs;
+# they exchange information only through the assimilation coupler at t = 0 and the rollout
+# coupler every 24 h.
+#
+# C-GLORS v8 is global, daily, on the ORCA0.25 native grid, and covers 1993-01-01 to
+# 2023-12-31, which bounds the date ranges below; ERA5 (O96, 1979-2024) is the wider of the two.
+# See docs/multi_time_latents_proposal.md.
+
+embed_unembed_mode: "block"
+embed_dropout_rate: 0.1
+
+# Defaults shared by both towers unless a group overrides them under latent.groups.*.encoder.
+ae_local_dim_embed: 2048
+ae_local_num_blocks: 0
+ae_local_num_heads: 16
+ae_local_dropout_rate: 0.1
+ae_local_with_qk_lnorm: True
+
+# The towers each hold their own latent tensor, so there is no shared query axis to partition.
+ae_local_num_queries: 1
+ae_local_queries_per_cell: False
+ae_adapter_num_heads: 16
+ae_adapter_embed: 128
+ae_adapter_with_qk_lnorm: True
+ae_adapter_with_residual: True
+ae_adapter_dropout_rate: 0.1
+
+ae_global_dim_embed: 2048
+ae_global_num_blocks: 4
+ae_global_num_heads: 32
+ae_global_dropout_rate: 0.1
+ae_global_with_qk_lnorm: True
+ae_global_att_dense_rate: 1.0
+ae_global_block_factor: 64
+ae_global_mlp_hidden_factor: 2
+ae_global_trailing_layer_norm: False
+
+ae_aggregation_num_blocks: 0
+ae_aggregation_num_heads: 32
+ae_aggregation_dropout_rate: 0.1
+ae_aggregation_with_qk_lnorm: True
+ae_aggregation_att_dense_rate: 1.0
+ae_aggregation_block_factor: 64
+ae_aggregation_mlp_hidden_factor: 2
+
+decoder_type: PerceiverIOCoordConditioning
+pred_adapter_kv: False
+pred_self_attention: True
+pred_dyadic_dims: False
+pred_mlp_adaln: True
+num_class_tokens: 0
+num_register_tokens: 0
+
+# fe_* is the fallback for a group that does not set its own
+fe_num_blocks: 16
+fe_num_heads: 16
+fe_dropout_rate: 0.1
+fe_with_qk_lnorm: True
+fe_layer_norm_after_blocks: [7]
+fe_impute_latent_noise_std: 1e-4
+forecast_att_dense_rate: 1.0
+
+latent:
+  # decode target for streams that do not set 'latent_group', and the tower a single-latent
+  # checkpoint's encoder and forecasting engine are mapped onto when warm-starting
+  default_group: atmosphere
+
+  groups:
+    atmosphere:
+      # input membership: which streams this tower ingests. A stream may appear in several
+      # groups; where it is *decoded* from is its own 'latent_group'.
+      streams: [ERA5]
+      dim_embed: 2048
+      encoder:
+        ae_global_num_blocks: 4
+      forecast:
+        time_step: 06:00:00       # advanced on every base step
+        num_blocks: 16
+        num_heads: 16
+        dropout_rate: 0.1
+
+    ocean:
+      streams: [C-GLORS]
+      # A narrower ocean tower is the lever that keeps a second tower from simply doubling the
+      # parameter count, but per-group widths need per-group decoder and engine widths, which
+      # is phase 3. Until then this must match the atmosphere, and the model rejects it
+      # otherwise; the saving comes from the shallower encoder and engine below.
+      dim_embed: 2048
+      encoder:
+        ae_global_num_blocks: 2
+      forecast:
+        time_step: 24:00:00       # advanced once every four base steps, held constant between
+        num_blocks: 8
+        num_heads: 16
+        dropout_rate: 0.1
+
+  coupling:
+    # shared width the towers are projected into; required because they differ above
+    dim_embed: 2048
+    assimilation:
+      # restores the cross-domain analysis that separate encoders remove
+      num_blocks: 2
+      num_heads: 32
+      dropout_rate: 0.1
+    rollout:
+      time_step: 24:00:00
+      num_blocks: 1
+      num_heads: 32
+      dropout_rate: 0.1
+
+healpix_level: 5
+
+rope_2D: False
+
+with_mixed_precision: True
+with_flash_attention: True
+compile_model: False
+with_fsdp: True
+attention_dtype: bf16
+mixed_precision_dtype: bf16
+mlp_norm_eps: 1e-5
+norm_eps: 1e-4
+
+latent_noise_kl_weight: 0.0
+latent_noise_gamma: 2.0
+latent_noise_saturate_encodings: 5
+latent_noise_use_additive_noise: False
+latent_noise_deterministic_latents: True
+
+freeze_modules: ""
+load_chkpt: {}
+
+norm_type: "LayerNorm"
+
+#####################################
+
+streams_directory: "./config/streams/era5_cglors/"
+streams: ???
+
+zarr_store: "zip"
+
+general:
+
+  istep: 0
+  rank: ???
+  world_size: ???
+
+  multiprocessing_method: "fork"
+
+  desc: ""
+  run_id: ???
+  run_history: []
+
+train_logging:
+  terminal: 10
+  metrics: 20
+  checkpoint: 250
+
+data_loading :
+
+  num_workers: 12
+  rng_seed: ???
+  repeat_data_in_mini_epoch : False
+
+
+training_config:
+
+  training_mode: ["masking"]
+
+  num_mini_epochs: 64
+  samples_per_mini_epoch: 4096
+  shuffle: True
+
+  # starts at the first day of the C-GLORS v8 record; validation and test hold out 2021-2023
+  start_date: 1993-01-01T00:00
+  end_date: 2020-12-31T00:00
+
+  # time_window_step must divide forecast.time_step below: the target window is located by
+  # integer division, step_forecast_dt = idx + (time_step * i) // time_window_step, so a 24 h
+  # window step would collapse the +6/+12/+18 h targets onto the analysis window itself.
+  time_window_step: 06:00:00
+  time_window_len: 06:00:00
+  # C-GLORS is daily, at 00 UTC, so only the windows starting at 00 UTC hold an ocean record.
+  # Starting every sample in one of those keeps the ocean input real, and the ocean engine then
+  # fires at step 4, on the only real ocean target; the +6/+12/+18 h ocean targets are spoofed
+  # and weighted 0. It also keeps a spoofed ocean input, whose chunk count varies between ranks,
+  # from reaching the FSDP2-sharded adapter. The targets stay on the 6 h grid above.
+  analysis_window_step: 24:00:00
+
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 5e-5
+    lr_final_decay: 2e-6
+    lr_final: 0.0
+    num_steps_warmup: 256
+    num_steps_cooldown: 512
+    policy_warmup: "cosine"
+    policy_decay: "constant"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  optimizer:
+    grad_clip: 1.0
+    weight_decay: 0.1
+    log_grad_norms: False
+    adamw :
+      beta1 : 0.98125
+      beta2 : 0.9875
+      eps : 2e-08
+
+  losses : {
+    "physical": {
+        type: LossPhysical,
+        loss_fcts: { "mse": { }, },
+        },
+    }
+
+  model_input: {
+    "forecasting" : {
+      masking_strategy: "forecast",
+      },
+    }
+
+  forecast :
+      time_step: 06:00:00
+      offset: 1
+      # must reach step 4 so the ocean tower's engine fires at least once
+      num_steps: 4
+      policy: "fixed"
+
+
+validation_config:
+
+  samples_per_mini_epoch: 256
+  shuffle: False
+
+  start_date: 2021-01-01T00:00
+  end_date: 2022-12-31T00:00
+
+  validate_with_ema:
+    enabled : True
+    ema_ramp_up_ratio: 0.09
+    ema_halflife_in_thousands: 600
+
+  output : {
+    num_samples: 0,
+    normalized_samples: False,
+    streams: null,
+    }
+
+  validate_before_training: False
+
+
+# merged on top of validation_config, and the default for inference. Held out from both training
+# and validation so that reported test skill is not the number the run was tuned against.
+test_config:
+
+  start_date: 2023-01-01T00:00
+  end_date: 2023-12-31T00:00
+
+
+wgtags:
+  org: cmcc
+  issue: null

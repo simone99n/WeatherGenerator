@@ -22,17 +22,22 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     check_reader_data,
 )
+from weathergen.train.utils import Stage
 
 _logger = logging.getLogger(__name__)
 
 
 class DataReaderGREP(DataReaderTimestep):
     """
-    Wrapper Data reader for gridded Zarr datasets with regular lat/lon structure.
+    Wrapper data reader for gridded Zarr datasets, in zarr format 2 or 3.
 
-    This reader handles datasets stored as Zarr with dimensions (time, latitude, longitude)
-        beta: handling  dimensions (time_centered, nav_lat, nav_lon)
-    Converts the gridded data to ReaderData format.
+    Two grid layouts are supported:
+      * regular 1-D lat/lon, e.g. E-OBS: ``latitude(lat)``, ``longitude(lon)``
+      * curvilinear 2-D, e.g. C-GLORS / NEMO ORCA: ``nav_lat(y, x)``, ``nav_lon(y, x)``
+
+    The time dimension is detected from the data variables rather than assumed, so ``time``,
+    ``time_centered``, ``time_counter`` and anything else all work. Converts the gridded data
+    to ReaderData format.
     """
 
     def __init__(
@@ -40,6 +45,7 @@ class DataReaderGREP(DataReaderTimestep):
         tw_handler: TimeWindowHandler,
         filename: Path,
         stream_info: dict,
+        stage: Stage | None = None,
     ) -> None:
         """
         Construct data reader for Zarr GREP dataset
@@ -50,6 +56,8 @@ class DataReaderGREP(DataReaderTimestep):
             filename (and path) of dataset
         stream_info :
             information about stream
+        stage :
+            training stage; accepted for interface compatibility, not used
 
         Returns
         -------
@@ -73,6 +81,15 @@ class DataReaderGREP(DataReaderTimestep):
         self.n_lon: int = 0
         self.n_points: int = 0
 
+        # Time axis, set once by _lazy_init; see _detect_time_dim for why both are needed.
+        self._time_dim: str | None = None
+        self._time_coord: str | None = None
+
+        # Opt-in, because E-OBS is a land-only grid whose NaN sea points are part of its
+        # distribution. C-GLORS needs it: its land mask is a coordinate sentinel that would
+        # otherwise collapse 288k points into one healpix cell.
+        self._drop_all_nan = bool(stream_info.get("drop_all_nan_rows", False))
+
         # debug
         self.log_debug = False
 
@@ -88,22 +105,15 @@ class DataReaderGREP(DataReaderTimestep):
             return
         self._initialized = True
 
-        try:
-            ds: xr.Dataset = xr.open_zarr(
-                self._filename, consolidated=True, chunks=None, zarr_format=2
-            )
-        except Exception as e:
-            name = self._stream_info["name"]
-            _logger.error(f"Failed to open {name} at {self._filename}: {e}")
-            return  # leave in empty state
+        # No zarr_format: zarr auto-detects format 2 and 3 stores. Deliberately not wrapped in
+        # try/except - a store that cannot be opened has to abort the run, because
+        # MultiStreamDataSampler silently substitutes spoofed mean-valued data for an empty
+        # stream and the run would then train on the remaining streams looking healthy.
+        ds: xr.Dataset = xr.open_zarr(self._filename, consolidated=True, chunks=None)
 
         # ---- Time axis -------------------------------------------------------
-
-        # TODO remove try/except
-        try:
-            time_coord: NDArray = ds.coords["time"].values
-        except KeyError:
-            time_coord: NDArray = ds.coords["time_centered"].values
+        self._time_dim, self._time_coord = _detect_time_dim(ds, self._stream_info["name"])
+        time_coord: NDArray = ds.coords[self._time_coord].values
 
         data_start_time = np.datetime64(time_coord[0])
         data_end_time = np.datetime64(time_coord[-1])
@@ -184,13 +194,12 @@ class DataReaderGREP(DataReaderTimestep):
             )
 
         # ---- Available variables (non-stat, time-varying) --------------------
-        time_variants = {"time", "time_centered"}
         available_vars: list[str] = [
             var
             for var in ds.data_vars
             if not var.endswith("_mean")
             and not var.endswith("_std")
-            and any(t in ds[var].dims for t in time_variants)  # "time" in ds[var].dims
+            and self._time_dim in ds[var].dims
         ]
 
         # ---- Channel selection -----------------------------------------------
@@ -217,6 +226,15 @@ class DataReaderGREP(DataReaderTimestep):
             f"{self.target_channels} (indices: {self.target_idx})"
         )
 
+        # A stream may legitimately have no channels on one side, but having none on either means
+        # the filters do not match this store - a silent no-op stream otherwise.
+        if available_vars and not self.source_idx and not self.target_idx:
+            raise ValueError(
+                f"Stream '{self._stream_info['name']}' selected no source and no target channels "
+                f"from {len(available_vars)} available variables. Check the 'source' / 'target' / "
+                f"'*_exclude' filters. Available: {available_vars[:20]}"
+            )
+
         self.geoinfo_channels = []
         self.geoinfo_idx = np.array([], dtype=np.int64)
         self.mean_geoinfo = np.zeros(0, dtype=np.float32)
@@ -227,7 +245,11 @@ class DataReaderGREP(DataReaderTimestep):
         # ---- Statistics ------------------------------------------------------
         # mean/stdev must be arrays of length == len(available_vars) so that
         # the base-class _normalize/_denormalize can index them with source_idx / target_idx.
-        self.mean, self.stdev = self._load_statistics(available_vars, ds)
+        # Only the selected slots are ever read, and a store may hold hundreds of variables, so
+        # this needs the channel selection above to have happened already.
+        self.mean, self.stdev = self._load_statistics(
+            available_vars, ds, set(self.source_idx) | set(self.target_idx)
+        )
 
         # ---- Length (timesteps inside the window) ----------------------------
         time_mask = (time_coord >= self._tw_handler.t_start) & (time_coord < self._tw_handler.t_end)
@@ -273,17 +295,28 @@ class DataReaderGREP(DataReaderTimestep):
         return selected_names, np.array(selected_idxs, dtype=np.int64)
 
     def _load_statistics(
-        self, available_vars: list[str], ds: xr.Dataset
+        self,
+        available_vars: list[str],
+        ds: xr.Dataset,
+        needed_idx: set[int] | None = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
         """
         Return mean and stdev arrays aligned with *available_vars* (not just selected channels).
         This matches the layout expected by DataReaderBase._normalize / _denormalize which index
         the arrays with source_idx / target_idx.
+
+        *needed_idx* restricts which slots are actually read from the store. Unread slots keep
+        their neutral 0.0 / 1.0 values and are never indexed. Each statistic is a separate scalar
+        array in the store, so on a several-hundred-variable store reading them all costs seconds
+        per worker for values nothing uses.
         """
         means = np.zeros(len(available_vars), dtype=np.float32)
         stds = np.ones(len(available_vars), dtype=np.float32)
 
         for i, ch in enumerate(available_vars):
+            if needed_idx is not None and i not in needed_idx:
+                continue
+
             mean_var = f"{ch}_mean"
             std_var = f"{ch}_std"
 
@@ -352,19 +385,8 @@ class DataReaderGREP(DataReaderTimestep):
 
         # Map channel indices → variable names
         selected_channels = [self.available_vars[i] for i in channels_idx]
-        # selected_channels = self.available_vars
 
-        data_arrays: list[NDArray] = []
-        datetimes_list: list[np.datetime64] = []
-
-        # TODO remove try/except
-        try:
-            # EOBS uses 'time'
-            time_values = self.ds.coords["time"].values
-        except KeyError:
-            # C-GLORS uses 'time_centered'
-            time_values = self.ds.coords["time_centered"].values
-
+        time_values = self.ds.coords[self._time_coord].values
         n_time = len(time_values)
 
         if self.log_debug:
@@ -372,39 +394,62 @@ class DataReaderGREP(DataReaderTimestep):
                 f"Available vars: {self.available_vars}, requested channels: {selected_channels}"
                 f"\n Fetching data for idx={idx} (dataset time range: "
                 f"{time_values[0]} to {time_values[-1]}), "
+                f"\n time dim: {self._time_dim}, time coord: {self._time_coord}"
                 f"\n Selected time indices: {t_idxs} -- len={len(t_idxs)}"
             )
+
+        # Full-grid coordinates, shared by every timestep before any row dropping.
+        if self._curvilinear:
+            # nav_lat/nav_lon are already flattened (n_points,)
+            coords_grid = np.stack([self._nav_lat_flat, self._nav_lon_flat], axis=1).astype(
+                np.float32
+            )
+            # Mask the fill points where nav_lat == 0 AND nav_lon == 0
+            masked = (self._nav_lat_flat == 0.0) & (self._nav_lon_flat == 0.0)
+            coords_grid[masked] = np.nan
+        else:
+            lon_grid, lat_grid = np.meshgrid(self.longitudes, self.latitudes)
+            coords_grid = np.stack([lat_grid.flatten(), lon_grid.flatten()], axis=1).astype(
+                np.float32
+            )
+
+        data_arrays: list[NDArray] = []
+        coords_arrays: list[NDArray] = []
+        datetimes_list: list[np.datetime64] = []
 
         for t_idx in t_idxs:
             if t_idx < 0 or t_idx >= n_time:
                 continue
 
             # (n_points, n_channels)
-            # TODO remove try/except: should be able to just use time or time_centered
-            # depending on dataset, without needing to guess per-timestep.
-            try:
-                timestep_data = np.stack(
-                    [
-                        self.ds[ch].isel(time=int(t_idx)).values.astype(np.float32).flatten()
-                        for ch in selected_channels
-                    ],
-                    axis=1,
-                )
-            except ValueError:
-                timestep_data = np.stack(
-                    [
-                        self.ds[ch]
-                        .isel(time_centered=int(t_idx))
-                        .values.astype(np.float32)
-                        .flatten()
-                        for ch in selected_channels
-                    ],
-                    axis=1,
-                )
+            timestep_data = np.stack(
+                [
+                    self.ds[ch]
+                    .isel({self._time_dim: int(t_idx)})
+                    .values.astype(np.float32)
+                    .flatten()
+                    for ch in selected_channels
+                ],
+                axis=1,
+            )
+            timestep_coords = coords_grid
+
+            # Drop grid points carrying no data in any selected channel, e.g. the ORCA land
+            # mask. Recomputed per timestep from the loaded values rather than cached, because
+            # the mask depends on selected_channels: a surface field and a deep level do not
+            # share one. Dropping here rather than downstream also keeps max_num_targets
+            # meaning what it says, since ReaderData.shuffle runs before the NaN-coord filter.
+            if self._drop_all_nan:
+                keep = ~np.isnan(timestep_data).all(axis=1)
+                if not keep.all():
+                    timestep_data = timestep_data[keep]
+                    timestep_coords = coords_grid[keep]
 
             data_arrays.append(timestep_data)
+            coords_arrays.append(timestep_coords)
             dt = np.datetime64(time_values[t_idx])
-            datetimes_list.extend([dt] * self.n_points)
+            # rows per timestep is not self.n_points once all-NaN rows are dropped
+            datetimes_list.extend([dt] * timestep_data.shape[0])
 
         if not data_arrays:
             _logger.info(f"No valid time indices found for idx={idx}; returning empty data.")
@@ -413,32 +458,9 @@ class DataReaderGREP(DataReaderTimestep):
                 num_geo_fields=0,
             )
 
-        # (n_timesteps * n_points, n_channels)
+        # (sum of per-timestep rows, n_channels)
         data = np.vstack(data_arrays)
-
-        # use actual count, not len(t_idxs)
-        n_valid_timesteps = len(data_arrays)
-
-        # Coordinate grid — handle both regular and curvilinear grids
-        if self._curvilinear:
-            # nav_lat/nav_lon are already flattened (n_points,)
-            coords_single = np.stack([self._nav_lat_flat, self._nav_lon_flat], axis=1).astype(
-                np.float32
-            )
-            # Maschera i punti dove nav_lat == 0 AND nav_lon == 0
-            masked = (self._nav_lat_flat == 0.0) & (self._nav_lon_flat == 0.0)
-            coords_single[masked] = np.nan
-        else:
-            lon_grid, lat_grid = np.meshgrid(self.longitudes, self.latitudes)
-            coords_single = np.stack([lat_grid.flatten(), lon_grid.flatten()], axis=1).astype(
-                np.float32
-            )
-
-        # NOTE tmp: prima era len(t_idxs) ma se ci sono t_idxs invalidi
-        # (es. fuori range del dataset) allora data_arrays sarà più corto di len(t_idxs).
-        # Meglio usare n_valid_timesteps che è il numero reale di timesteps validi
-        # che abbiamo effettivamente caricato.
-        coords = np.tile(coords_single, (n_valid_timesteps, 1))
+        coords = np.vstack(coords_arrays)
 
         geoinfos = np.zeros((len(data), 0), dtype=np.float32)
         datetimes = np.array(datetimes_list, dtype="datetime64[s]")
@@ -472,8 +494,56 @@ class DataReaderGREP(DataReaderTimestep):
 
 
 # ---------------------------------------------------------------------------
-# Module-level helper (replaces the non-existent str_to_timedelta import)
+# Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _detect_time_dim(ds: xr.Dataset, name: str) -> tuple[str, str]:
+    """
+    Identify the time dimension and the coordinate holding its values.
+
+    The time axis is found structurally rather than by name, for two reasons. The naming is not
+    stable across datasets - E-OBS uses 'time', C-GLORS v7 'time_centered', C-GLORS v8
+    'time_counter' - and the dimension name and the coordinate name can differ: stock NEMO output
+    has a 'time_counter' dimension carrying auxiliary 'time_centered' and 'time_instant'
+    coordinates, so indexing by coordinate name would fail.
+
+    A time axis is taken to be a dimension that has a 1-D datetime64 coordinate and is shared by
+    the data variables. Candidates are ranked by how many data variables carry them, preferring a
+    dimension that also has a same-named index coordinate.
+
+    Parameters
+    ----------
+    ds :
+        open dataset
+    name :
+        stream name, for error messages
+
+    Returns
+    -------
+    (time dimension name, time coordinate name)
+    """
+    dt_coords: dict[str, list[str]] = {}
+    for coord_name, coord in ds.coords.items():
+        if coord.ndim == 1 and np.issubdtype(coord.dtype, np.datetime64):
+            dt_coords.setdefault(str(coord.dims[0]), []).append(str(coord_name))
+
+    if not dt_coords:
+        raise ValueError(
+            f"Dataset '{name}' has no 1-D datetime coordinate, so its time axis cannot be "
+            f"identified. Coordinates: {list(ds.coords)}"
+        )
+
+    def _rank(dim: str) -> tuple[int, bool]:
+        n_vars = sum(1 for var in ds.data_vars if dim in ds[var].dims)
+        return (n_vars, dim in dt_coords[dim])
+
+    time_dim = max(dt_coords, key=_rank)
+    coord_names = dt_coords[time_dim]
+    time_coord = time_dim if time_dim in coord_names else coord_names[0]
+
+    _logger.info(f"{name}: time dimension '{time_dim}', time coordinate '{time_coord}'.")
+    return time_dim, time_coord
 
 
 def _str_to_timedelta(s: str) -> np.timedelta64:
